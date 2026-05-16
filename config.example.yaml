@@ -1,0 +1,21 @@
+server:
+  host: 0.0.0.0
+  port: 8110
+
+security:
+  username: "your_admin_username"
+  password: "your_strong_password_here"
+  jwt_secret_key: "your_jwt_secret_key_here"
+  jwt_algorithm: "HS256"
+
+llm:
+  api_key: "sk-your-api-key-here"
+  base_url: "https://api.minimaxi.com/v1"
+  model_name: "MiniMax-M2.7"
+
+crawler:
+  jina_base_url: "https://r.jina.ai/https://html.duckduckgo.com/html/?q="
+  jina_api_key: ""
+
+storage:
+  vault_path: "./vault"

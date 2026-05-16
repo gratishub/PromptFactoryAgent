@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Prompt Vault Atom Workspace</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link
+    rel="stylesheet"
+    href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github.min.css"
+  />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-800">
+  <div id="app"></div>
+
+  <script>
+    const { createApp, computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } = Vue;
+
+    marked.setOptions({
+      breaks: true,
+      gfm: true,
+      highlight(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+      },
+    });
+
+    createApp({
+      setup() {
+        const tokenKey = "prompt_vault_token";
+        const searchTimer = ref(null);
+        const state = reactive({
+          token: localStorage.getItem(tokenKey) || "",
+          loginForm: { username: "", password: "" },
+          loggingIn: false,
+          loading: false,
+          saving: false,
+          deleting: false,
+          mining: false,
+          toast: null,
+          prompts: [],
+          availableTags: [],
+          selectedTag: "",
+          search: "",
+          drawerOpen: false,
+          drawerMode: "preview",
+          currentPrompt: null,
+          editor: { title: "", content: "", tagsText: "", category: "" },
+          mineKeyword: "",
+        });
+
+        const filteredPromptCount = computed(() => state.prompts.length);
+        const renderedMarkdown = computed(() => marked.parse(state.editor.content || ""));
+
+        function showToast(message, type = "success") {
+          state.toast = { message, type };
+          window.setTimeout(() => {
+            if (state.toast && state.toast.message === message) {
+              state.toast = null;
+            }
+          }, 2000);
+        }
+
+        function clearSession() {
+          state.token = "";
+          localStorage.removeItem(tokenKey);
+          state.prompts = [];
+          state.availableTags = [];
+          state.drawerOpen = false;
+          state.currentPrompt = null;
+        }
+
+        async function apiFetch(url, options = {}) {
+          const headers = new Headers(options.headers || {});
+          if (!(options.body instanceof FormData) && !headers.has("Content-Type")) {
+            headers.set("Content-Type", "application/json");
+          }
+          if (state.token) {
+            headers.set("Authorization", `Bearer ${state.token}`);
+          }
+          const response = await fetch(url, { ...options, headers });
+          if (response.status === 401) {
+            clearSession();
+            showToast("登录已失效，请重新登录", "error");
+            throw new Error("unauthorized");
+          }
+          return response;
+        }
+
+        function tagsToText(tags) {
+          return (tags || []).join(", ");
+        }
+
+        function tagsFromText(text) {
+          return text
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean);
+        }
+
+        async function login() {
+          state.loggingIn = true;
+          try {
+            const response = await fetch("/api/login", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(state.loginForm),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.detail || "登录失败");
+            }
+            state.token = payload.access_token;
+            localStorage.setItem(tokenKey, payload.access_token);
+            state.loginForm.password = "";
+            await loadPrompts(true);
+            showToast("登录成功");
+          } catch (error) {
+            showToast(error.message || "登录失败", "error");
+          } finally {
+            state.loggingIn = false;
+          }
+        }
+
+        async function loadPrompts(resetSelection = false) {
+          if (!state.token) return;
+          state.loading = true;
+          try {
+            const params = new URLSearchParams();
+            if (state.search.trim()) params.set("q", state.search.trim());
+            if (state.selectedTag) params.set("tag", state.selectedTag);
+            const response = await apiFetch(`/api/prompts?${params.toString()}`);
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.detail || "加载失败");
+            }
+            state.prompts = payload.items || [];
+            state.availableTags = payload.available_tags || [];
+            if (resetSelection && state.prompts.length > 0) {
+              await openPrompt(state.prompts[0].id);
+            }
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "加载失败", "error");
+            }
+          } finally {
+            state.loading = false;
+          }
+        }
+
+        async function openPrompt(id) {
+          try {
+            const response = await apiFetch(`/api/prompts/${id}`);
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.detail || "读取详情失败");
+            }
+            state.currentPrompt = payload;
+            state.editor.title = payload.title || "";
+            state.editor.content = payload.content || "";
+            state.editor.tagsText = tagsToText(payload.tags || []);
+            state.editor.category = payload.category || "";
+            state.drawerOpen = true;
+            await nextTick();
+            document.querySelectorAll("pre code").forEach((block) => hljs.highlightElement(block));
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "读取详情失败", "error");
+            }
+          }
+        }
+
+        function newPrompt() {
+          state.currentPrompt = null;
+          state.editor.title = "";
+          state.editor.content = "";
+          state.editor.tagsText = "";
+          state.editor.category = "通用";
+          state.drawerMode = "edit";
+          state.drawerOpen = true;
+        }
+
+        async function savePrompt() {
+          state.saving = true;
+          try {
+            const payload = {
+              title: state.editor.title,
+              content: state.editor.content,
+              tags: tagsFromText(state.editor.tagsText),
+              category: state.editor.category || "通用",
+            };
+            const isUpdate = !!(state.currentPrompt && state.currentPrompt.id);
+            const response = await apiFetch(
+              isUpdate ? `/api/prompts/${state.currentPrompt.id}` : "/api/prompts",
+              {
+                method: isUpdate ? "PUT" : "POST",
+                body: JSON.stringify(payload),
+              }
+            );
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(body.detail || "保存失败");
+            }
+            state.currentPrompt = body;
+            state.editor.title = body.title;
+            state.editor.content = body.content;
+            state.editor.tagsText = tagsToText(body.tags || []);
+            state.editor.category = body.category || "";
+            await loadPrompts();
+            state.drawerMode = "preview";
+            showToast("保存成功");
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "保存失败", "error");
+            }
+          } finally {
+            state.saving = false;
+          }
+        }
+
+        async function deletePrompt() {
+          if (!(state.currentPrompt && state.currentPrompt.id)) {
+            showToast("当前提示词尚未保存", "error");
+            return;
+          }
+          if (!window.confirm(`确认删除 ${state.currentPrompt.title} ?`)) {
+            return;
+          }
+          state.deleting = true;
+          try {
+            const response = await apiFetch(`/api/prompts/${state.currentPrompt.id}`, {
+              method: "DELETE",
+            });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(body.detail || "删除失败");
+            }
+            state.drawerOpen = false;
+            state.currentPrompt = null;
+            await loadPrompts();
+            showToast("删除成功");
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "删除失败", "error");
+            }
+          } finally {
+            state.deleting = false;
+          }
+        }
+
+        async function minePrompt() {
+          if (!state.mineKeyword.trim()) {
+            showToast("请输入挖掘关键词", "error");
+            return;
+          }
+          state.mining = true;
+          try {
+            const response = await apiFetch("/api/mine-prompt", {
+              method: "POST",
+              body: JSON.stringify({ keyword: state.mineKeyword.trim() }),
+            });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(body.detail || "挖掘失败");
+            }
+            await loadPrompts();
+            await openPrompt(body.prompt.id);
+            state.mineKeyword = "";
+            showToast("提示词已挖掘入库");
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "挖掘失败", "error");
+            }
+          } finally {
+            state.mining = false;
+          }
+        }
+
+        async function copyPrompt() {
+          try {
+            await navigator.clipboard.writeText(state.editor.content || "");
+            showToast("已复制提示词");
+          } catch (error) {
+            showToast("复制失败", "error");
+          }
+        }
+
+        function logout() {
+          clearSession();
+          showToast("已退出登录");
+        }
+
+        function closeDrawer() {
+          state.drawerOpen = false;
+        }
+
+        function debouncedSearch() {
+          if (searchTimer.value) {
+            window.clearTimeout(searchTimer.value);
+          }
+          searchTimer.value = window.setTimeout(() => {
+            loadPrompts();
+          }, 280);
+        }
+
+        function onSearchEnter() {
+          if (searchTimer.value) {
+            window.clearTimeout(searchTimer.value);
+          }
+          loadPrompts();
+        }
+
+        function toggleTag(tag) {
+          state.selectedTag = state.selectedTag === tag ? "" : tag;
+          loadPrompts();
+        }
+
+        function handleShortcut(event) {
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && state.drawerOpen) {
+            event.preventDefault();
+            savePrompt();
+          }
+        }
+
+        watch(
+          () => state.drawerMode,
+          async (mode) => {
+            if (mode === "preview") {
+              await nextTick();
+              document.querySelectorAll("pre code").forEach((block) => hljs.highlightElement(block));
+            }
+          }
+        );
+
+        onMounted(async () => {
+          window.addEventListener("keydown", handleShortcut);
+          if (state.token) {
+            await loadPrompts(true);
+          }
+        });
+
+        onBeforeUnmount(() => {
+          window.removeEventListener("keydown", handleShortcut);
+          if (searchTimer.value) {
+            window.clearTimeout(searchTimer.value);
+          }
+        });
+
+        return {
+          state,
+          filteredPromptCount,
+          renderedMarkdown,
+          login,
+          logout,
+          loadPrompts,
+          openPrompt,
+          newPrompt,
+          savePrompt,
+          deletePrompt,
+          copyPrompt,
+          closeDrawer,
+          debouncedSearch,
+          onSearchEnter,
+          toggleTag,
+          minePrompt,
+        };
+      },
+      template: `
+        <div class="min-h-screen">
+          <transition name="fade">
+            <div v-if="state.toast" class="fixed right-6 top-6 z-[80]">
+              <div
+                class="rounded-2xl border px-4 py-3 shadow-lg backdrop-blur"
+                :class="state.toast.type === 'error'
+                  ? 'border-rose-200 bg-white/90 text-rose-700'
+                  : 'border-emerald-200 bg-white/90 text-emerald-700'"
+              >
+                {{ state.toast.message }}
+              </div>
+            </div>
+          </transition>
+
+          <div
+            v-if="!state.token"
+            class="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.2),_transparent_35%),linear-gradient(180deg,_#f8fafc_0%,_#eef2ff_100%)] p-6"
+          >
+            <div class="w-full max-w-md rounded-[2rem] border border-white/60 bg-white/70 p-8 shadow-2xl shadow-slate-200/60 backdrop-blur-xl">
+              <div class="mb-8">
+                <p class="text-sm uppercase tracking-[0.35em] text-slate-400">Prompt Vault</p>
+                <h1 class="mt-3 text-3xl font-semibold text-slate-900">安全登录</h1>
+                <p class="mt-2 text-sm text-slate-500">进入原子卡片搜索工作台。</p>
+              </div>
+              <div class="space-y-4">
+                <input
+                  v-model="state.loginForm.username"
+                  type="text"
+                  placeholder="Username"
+                  class="w-full rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+                />
+                <input
+                  v-model="state.loginForm.password"
+                  type="password"
+                  placeholder="Password"
+                  class="w-full rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+                  @keyup.enter="login"
+                />
+                <button
+                  class="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
+                  :disabled="state.loggingIn"
+                  @click="login"
+                >
+                  {{ state.loggingIn ? '登录中...' : '登录' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="min-h-screen">
+            <header class="sticky top-0 z-30 border-b border-slate-200/80 bg-white/80 backdrop-blur-xl">
+              <div class="mx-auto flex max-w-[1600px] items-center gap-4 px-4 py-4 md:px-6">
+                <div class="flex min-w-[200px] items-center gap-3">
+                  <div class="flex h-11 w-11 items-center justify-center rounded-2xl bg-slate-900 text-lg font-semibold text-white shadow-lg shadow-slate-300">P</div>
+                  <div>
+                    <div class="text-xs uppercase tracking-[0.35em] text-slate-400">Atom Workspace</div>
+                    <div class="text-lg font-semibold text-slate-900">Prompt Vault</div>
+                  </div>
+                </div>
+
+                <div class="relative flex-1">
+                  <svg class="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="7"></circle>
+                    <path d="m20 20-3.5-3.5"></path>
+                  </svg>
+                  <input
+                    v-model="state.search"
+                    @input="debouncedSearch"
+                    @keyup.enter="onSearchEnter"
+                    type="text"
+                    placeholder="搜索标题或内容..."
+                    class="w-full rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-12 pr-4 text-sm outline-none transition focus:border-slate-900"
+                  />
+                </div>
+
+                <div class="flex items-center gap-3">
+                  <input
+                    v-model="state.mineKeyword"
+                    type="text"
+                    placeholder="输入关键词后挖掘"
+                    class="hidden rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900 lg:block"
+                  />
+                  <button
+                    class="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 hover:border-slate-900 hover:text-slate-900 disabled:opacity-60"
+                    :disabled="state.mining"
+                    @click="minePrompt"
+                  >
+                    {{ state.mining ? '挖掘中...' : '发起挖掘' }}
+                  </button>
+                  <button
+                    class="rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white hover:bg-slate-800"
+                    @click="logout"
+                  >
+                    退出登录
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            <div class="mx-auto grid max-w-[1600px] grid-cols-1 gap-6 px-4 py-6 md:px-6 xl:grid-cols-[280px_minmax(0,1fr)]">
+              <aside class="space-y-6">
+                <section class="rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm">
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Filters</p>
+                      <h2 class="mt-2 text-lg font-semibold text-slate-900">标签 / 分类云</h2>
+                    </div>
+                    <button
+                      class="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900"
+                      @click="newPrompt"
+                    >
+                      新建
+                    </button>
+                  </div>
+                  <div class="mt-5 flex flex-wrap gap-2">
+                    <button
+                      class="rounded-full border px-3 py-2 text-xs font-medium transition"
+                      :class="state.selectedTag === ''
+                        ? 'border-slate-900 bg-slate-900 text-white'
+                        : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-900 hover:text-slate-900'"
+                      @click="toggleTag('')"
+                    >
+                      全部
+                    </button>
+                    <button
+                      v-for="tag in state.availableTags"
+                      :key="tag"
+                      class="rounded-full border px-3 py-2 text-xs font-medium transition"
+                      :class="state.selectedTag === tag
+                        ? 'border-slate-900 bg-slate-900 text-white'
+                        : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-900 hover:text-slate-900'"
+                      @click="toggleTag(tag)"
+                    >
+                      {{ tag }}
+                    </button>
+                  </div>
+                </section>
+              </aside>
+
+              <main class="space-y-5">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Results</p>
+                    <h2 class="mt-2 text-2xl font-semibold text-slate-900">原子卡片搜索工作台</h2>
+                    <p class="mt-2 text-sm text-slate-500">共 {{ filteredPromptCount }} 条匹配结果</p>
+                  </div>
+                </div>
+
+                <div v-if="state.loading" class="rounded-[2rem] border border-slate-200 bg-white p-10 text-center text-sm text-slate-400 shadow-sm">
+                  正在加载提示词数据...
+                </div>
+
+                <div
+                  v-else-if="state.prompts.length === 0"
+                  class="rounded-[2rem] border border-dashed border-slate-300 bg-white/80 p-12 text-center shadow-sm"
+                >
+                  <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Empty</p>
+                  <h3 class="mt-3 text-2xl font-semibold text-slate-900">没有匹配的提示词</h3>
+                  <p class="mt-3 text-sm text-slate-500">调整搜索条件、切换标签，或新建一条提示词。</p>
+                </div>
+
+                <div v-else class="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3">
+                  <article
+                    v-for="item in state.prompts"
+                    :key="item.id"
+                    @click="openPrompt(item.id)"
+                    class="group cursor-pointer rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm transition duration-200 hover:-translate-y-1 hover:shadow-xl hover:shadow-slate-200/70"
+                  >
+                    <div class="flex items-start justify-between gap-3">
+                      <h3 class="line-clamp-2 text-lg font-semibold text-slate-900">{{ item.title }}</h3>
+                      <span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        {{ item.category }}
+                      </span>
+                    </div>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      <span
+                        v-for="tag in item.tags.slice(0, 3)"
+                        :key="tag"
+                        class="rounded-full bg-slate-50 px-2.5 py-1 text-xs text-slate-500"
+                      >
+                        {{ tag }}
+                      </span>
+                    </div>
+                    <p class="mt-4 text-sm leading-7 text-slate-600 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                      {{ item.excerpt }}
+                    </p>
+                    <div class="mt-5 text-xs text-slate-400">
+                      最近更新：{{ new Date(item.updated_at).toLocaleString() }}
+                    </div>
+                  </article>
+                </div>
+              </main>
+            </div>
+
+            <transition name="slide">
+              <div v-if="state.drawerOpen" class="fixed inset-0 z-40 flex justify-end bg-slate-950/30 backdrop-blur-[2px]">
+                <div class="flex h-full w-full max-w-4xl flex-col bg-white shadow-2xl shadow-slate-300/60">
+                  <div class="flex items-center justify-between border-b border-slate-200 px-6 py-5">
+                    <div>
+                      <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Prompt Detail</p>
+                      <h3 class="mt-2 text-2xl font-semibold text-slate-900">
+                        {{ state.currentPrompt ? state.currentPrompt.title : '新建提示词' }}
+                      </h3>
+                    </div>
+                    <button
+                      class="rounded-2xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
+                      @click="closeDrawer"
+                    >
+                      关闭
+                    </button>
+                  </div>
+
+                  <div class="flex items-center justify-between border-b border-slate-200 px-6 py-4">
+                    <div class="rounded-2xl border border-slate-200 bg-slate-50 p-1">
+                      <button
+                        class="rounded-xl px-4 py-2 text-sm font-medium transition"
+                        :class="state.drawerMode === 'edit' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'"
+                        @click="state.drawerMode = 'edit'"
+                      >
+                        编辑模式
+                      </button>
+                      <button
+                        class="rounded-xl px-4 py-2 text-sm font-medium transition"
+                        :class="state.drawerMode === 'preview' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'"
+                        @click="state.drawerMode = 'preview'"
+                      >
+                        预览模式
+                      </button>
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                      <button
+                        class="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
+                        @click="copyPrompt"
+                      >
+                        复制提示词
+                      </button>
+                      <button
+                        class="rounded-2xl border border-rose-200 bg-white px-4 py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-60"
+                        :disabled="state.deleting"
+                        @click="deletePrompt"
+                      >
+                        {{ state.deleting ? '删除中...' : '删除' }}
+                      </button>
+                      <button
+                        class="rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
+                        :disabled="state.saving"
+                        @click="savePrompt"
+                      >
+                        {{ state.saving ? '保存中...' : '保存' }}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="flex-1 overflow-y-auto px-6 py-6">
+                    <div v-if="state.drawerMode === 'edit'" class="space-y-5">
+                      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+                        <div>
+                          <label class="mb-2 block text-sm font-medium text-slate-600">标题</label>
+                          <input
+                            v-model="state.editor.title"
+                            type="text"
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+                          />
+                        </div>
+                        <div>
+                          <label class="mb-2 block text-sm font-medium text-slate-600">分类</label>
+                          <input
+                            v-model="state.editor.category"
+                            type="text"
+                            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label class="mb-2 block text-sm font-medium text-slate-600">标签</label>
+                        <input
+                          v-model="state.editor.tagsText"
+                          type="text"
+                          placeholder="#分类/通用, #主题/Agent"
+                          class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+                        />
+                      </div>
+                      <div>
+                        <label class="mb-2 block text-sm font-medium text-slate-600">提示词内容</label>
+                        <textarea
+                          v-model="state.editor.content"
+                          class="min-h-[420px] w-full rounded-[2rem] border border-slate-200 bg-white p-5 font-mono text-sm leading-7 text-slate-800 outline-none transition focus:border-slate-900 whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                        ></textarea>
+                      </div>
+                    </div>
+
+                    <article
+                      v-else
+                      class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                      v-html="renderedMarkdown"
+                    ></article>
+                  </div>
+                </div>
+              </div>
+            </transition>
+          </div>
+        </div>
+      `,
+    }).mount("#app");
+  </script>
+
+  <style>
+    .fade-enter-active,
+    .fade-leave-active,
+    .slide-enter-active,
+    .slide-leave-active {
+      transition: all 0.24s ease;
+    }
+    .fade-enter-from,
+    .fade-leave-to {
+      opacity: 0;
+      transform: translateY(-6px);
+    }
+    .slide-enter-from,
+    .slide-leave-to {
+      opacity: 0;
+    }
+    .slide-enter-from > div,
+    .slide-leave-to > div {
+      transform: translateX(24px);
+    }
+    pre,
+    code {
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</body>
+</html>

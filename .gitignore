@@ -11,6 +11,9 @@ prompts.db
 *.log
 miner.log
 
+# Internal/private docs
+internal/
+
 # Python
 __pycache__/
 *.py[cod]

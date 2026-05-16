@@ -7,6 +7,7 @@ security:
   password: "your_strong_password_here"
   jwt_secret_key: "your_jwt_secret_key_here"
   jwt_algorithm: "HS256"
+  cookie_secure: null
 
 llm:
   api_key: "sk-your-api-key-here"
@@ -19,3 +20,18 @@ crawler:
 
 storage:
   vault_path: "./vault"
+  allowed_export_paths:
+    - "./vault"
+
+# Security note:
+# Production secrets should be injected from environment variables instead of being stored in config.yaml.
+# Supported overrides:
+# PROMPT_MINER_USERNAME
+# PROMPT_MINER_PASSWORD
+# PROMPT_MINER_JWT_SECRET_KEY
+# PROMPT_MINER_LLM_API_KEY
+# PROMPT_MINER_LLM_BASE_URL
+# PROMPT_MINER_LLM_MODEL_NAME
+# PROMPT_MINER_JINA_API_KEY
+# PROMPT_MINER_COOKIE_SECURE
+# PROMPT_MINER_ALLOWED_EXPORT_PATHS

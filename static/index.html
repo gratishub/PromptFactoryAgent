@@ -32,10 +32,9 @@
 
     createApp({
       setup() {
-        const tokenKey = "prompt_vault_token";
         const searchTimer = ref(null);
         const state = reactive({
-          token: localStorage.getItem(tokenKey) || "",
+          authenticated: false,
           loginForm: { username: "", password: "" },
           loggingIn: false,
           loading: false,
@@ -67,8 +66,7 @@
         }
 
         function clearSession() {
-          state.token = "";
-          localStorage.removeItem(tokenKey);
+          state.authenticated = false;
           state.prompts = [];
           state.availableTags = [];
           state.drawerOpen = false;
@@ -80,10 +78,7 @@
           if (!(options.body instanceof FormData) && !headers.has("Content-Type")) {
             headers.set("Content-Type", "application/json");
           }
-          if (state.token) {
-            headers.set("Authorization", `Bearer ${state.token}`);
-          }
-          const response = await fetch(url, { ...options, headers });
+          const response = await fetch(url, { ...options, headers, credentials: "same-origin" });
           if (response.status === 401) {
             clearSession();
             showToast("登录已失效，请重新登录", "error");
@@ -110,13 +105,13 @@
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(state.loginForm),
+              credentials: "same-origin",
             });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
               throw new Error(payload.detail || "登录失败");
             }
-            state.token = payload.access_token;
-            localStorage.setItem(tokenKey, payload.access_token);
+            state.authenticated = true;
             state.loginForm.password = "";
             await loadPrompts(true);
             showToast("登录成功");
@@ -128,12 +123,14 @@
         }
 
         async function loadPrompts(resetSelection = false) {
-          if (!state.token) return;
+          if (!state.authenticated) return;
           state.loading = true;
           try {
             const params = new URLSearchParams();
             if (state.search.trim()) params.set("q", state.search.trim());
             if (state.selectedTag) params.set("tag", state.selectedTag);
+            params.set("limit", "60");
+            params.set("offset", "0");
             const response = await apiFetch(`/api/prompts?${params.toString()}`);
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -291,8 +288,12 @@
         }
 
         function logout() {
-          clearSession();
-          showToast("已退出登录");
+          apiFetch("/api/logout", { method: "POST" })
+            .catch(() => null)
+            .finally(() => {
+              clearSession();
+              showToast("已退出登录");
+            });
         }
 
         function closeDrawer() {
@@ -337,11 +338,22 @@
           }
         );
 
+        async function restoreSession() {
+          try {
+            const response = await apiFetch("/api/session");
+            if (!response.ok) {
+              throw new Error("unauthorized");
+            }
+            state.authenticated = true;
+            await loadPrompts(true);
+          } catch (error) {
+            clearSession();
+          }
+        }
+
         onMounted(async () => {
           window.addEventListener("keydown", handleShortcut);
-          if (state.token) {
-            await loadPrompts(true);
-          }
+          await restoreSession();
         });
 
         onBeforeUnmount(() => {
@@ -368,6 +380,7 @@
           onSearchEnter,
           toggleTag,
           minePrompt,
+          restoreSession,
         };
       },
       template: `
@@ -386,7 +399,7 @@
           </transition>
 
           <div
-            v-if="!state.token"
+            v-if="!state.authenticated"
             class="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.2),_transparent_35%),linear-gradient(180deg,_#f8fafc_0%,_#eef2ff_100%)] p-6"
           >
             <div class="w-full max-w-md rounded-[2rem] border border-white/60 bg-white/70 p-8 shadow-2xl shadow-slate-200/60 backdrop-blur-xl">

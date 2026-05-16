@@ -22,7 +22,14 @@ pip install -r requirements.txt
 
 # 配置环境
 cp config.example.yaml config.yaml
-# 编辑 config.yaml，填入你的 API Key 和认证信息
+# 编辑 config.yaml，填入基础配置
+# 生产环境请优先使用环境变量注入敏感信息
+
+export PROMPT_MINER_USERNAME="admin"
+export PROMPT_MINER_PASSWORD="replace-with-strong-password"
+export PROMPT_MINER_JWT_SECRET_KEY="replace-with-a-long-random-secret"
+export PROMPT_MINER_LLM_API_KEY="sk-..."
+export PROMPT_MINER_COOKIE_SECURE="true"
 
 # 启动服务
 python3 miner.py
@@ -60,4 +67,10 @@ Content-Type: application/json
 
 ## 安全说明
 
-`config.yaml` 包含敏感凭据，请勿提交到公共仓库。参考 `config.example.yaml` 进行配置。
+`config.yaml` 不应保存生产口令、JWT 密钥和 API Key。生产部署时请使用环境变量覆盖敏感项，并确保服务仅在 HTTPS 或可信内网后面暴露。
+
+如果要避免保存明文密码，`PROMPT_MINER_PASSWORD` 支持使用 `pbkdf2_sha256$迭代次数$salt$hash` 格式的哈希值。
+
+文件导出路径校验支持通过 `storage.allowed_export_paths` 配置允许目录列表。默认只允许写入 `storage.vault_path`，如果你需要扩展导出目标，必须显式把目录加入白名单。
+
+如果服务运行在 nginx 或 Cloudflare 等反向代理后面，Cookie 的 `Secure` 属性可以通过 `security.cookie_secure` 或环境变量 `PROMPT_MINER_COOKIE_SECURE` 显式控制。未显式设置时，服务会优先参考 `X-Forwarded-Proto`。

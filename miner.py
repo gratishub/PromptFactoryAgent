@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import secrets
 import re
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from hmac import compare_digest
+from hashlib import pbkdf2_hmac
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -15,8 +20,8 @@ import httpx
 import jwt
 import uvicorn
 import yaml
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
@@ -28,7 +33,16 @@ STATIC_DIR = Path(__file__).with_name("static")
 DB_PATH = Path(__file__).with_name("prompts.db")
 SEARCH_SUFFIX = " prompt github"
 REQUEST_TIMEOUT = 30.0
-TOKEN_EXPIRE_HOURS = 12
+TOKEN_EXPIRE_MINUTES = 30
+JWT_ISSUER = "prompt-miner"
+JWT_AUDIENCE = "prompt-miner-ui"
+AUTH_COOKIE_NAME = "prompt_miner_session"
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_LOCK_MINUTES = 15
+LOGIN_MAX_ATTEMPTS = 5
+SEARCH_QUERY_MAX_LENGTH = 120
+PROMPT_LIST_MAX_LIMIT = 100
+PBKDF2_ITERATIONS = 600000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("prompt-miner")
@@ -44,6 +58,7 @@ class SecurityConfig(BaseModel):
     password: str
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
+    cookie_secure: bool | None = None
 
 
 class LLMConfig(BaseModel):
@@ -59,6 +74,7 @@ class CrawlerConfig(BaseModel):
 
 class StorageConfig(BaseModel):
     vault_path: str
+    allowed_export_paths: list[str] = Field(default_factory=list)
 
 
 class AppConfig(BaseModel):
@@ -83,8 +99,13 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    access_token: str
+    access_token: str | None = None
     token_type: str = "bearer"
+
+
+class SessionResponse(BaseModel):
+    authenticated: bool
+    username: str | None = None
 
 
 class MinePromptRequest(BaseModel):
@@ -161,6 +182,7 @@ class PromptListItem(BaseModel):
 class PromptListResponse(BaseModel):
     items: list[PromptListItem]
     available_tags: list[str]
+    total: int
 
 
 class PromptDetail(BaseModel):
@@ -188,9 +210,82 @@ def load_config(config_path: Path) -> AppConfig:
 
 
 CONFIG = load_config(CONFIG_PATH)
-app = FastAPI(title="Prompt Mining Engine", version="3.0.0")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 auth_scheme = HTTPBearer(auto_error=False)
+LOGIN_ATTEMPTS: dict[str, dict[str, Any]] = {}
+
+
+def env_override(name: str, fallback: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return fallback
+    return value.strip()
+
+
+def password_is_hashed(value: str) -> bool:
+    return value.startswith("pbkdf2_sha256$")
+
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    actual_salt = salt or secrets.token_hex(16)
+    derived = pbkdf2_hmac("sha256", password.encode("utf-8"), actual_salt.encode("utf-8"), PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${actual_salt}${derived.hex()}"
+
+
+def verify_password(plain_password: str, configured_password: str) -> bool:
+    if password_is_hashed(configured_password):
+        try:
+            _, iterations, salt, expected_hash = configured_password.split("$", 3)
+            actual_hash = pbkdf2_hmac(
+                "sha256",
+                plain_password.encode("utf-8"),
+                salt.encode("utf-8"),
+                int(iterations),
+            ).hex()
+            return compare_digest(actual_hash, expected_hash)
+        except ValueError:
+            LOGGER.error("password 哈希格式非法")
+            return False
+    return compare_digest(plain_password, configured_password)
+
+
+def apply_env_overrides(config: AppConfig) -> AppConfig:
+    config.security.username = env_override("PROMPT_MINER_USERNAME", config.security.username)
+    config.security.password = env_override("PROMPT_MINER_PASSWORD", config.security.password)
+    config.security.jwt_secret_key = env_override("PROMPT_MINER_JWT_SECRET_KEY", config.security.jwt_secret_key)
+    cookie_secure_override = os.getenv("PROMPT_MINER_COOKIE_SECURE")
+    if cookie_secure_override is not None:
+        config.security.cookie_secure = cookie_secure_override.strip().lower() in {"1", "true", "yes", "on"}
+    config.llm.api_key = env_override("PROMPT_MINER_LLM_API_KEY", config.llm.api_key)
+    config.llm.base_url = env_override("PROMPT_MINER_LLM_BASE_URL", config.llm.base_url)
+    config.llm.model_name = env_override("PROMPT_MINER_LLM_MODEL_NAME", config.llm.model_name)
+    config.crawler.jina_api_key = env_override("PROMPT_MINER_JINA_API_KEY", config.crawler.jina_api_key)
+    allowed_paths_override = os.getenv("PROMPT_MINER_ALLOWED_EXPORT_PATHS")
+    if allowed_paths_override is not None:
+        config.storage.allowed_export_paths = [
+            item.strip() for item in allowed_paths_override.split(",") if item.strip()
+        ]
+    return config
+
+
+def validate_security_config(config: AppConfig) -> None:
+    if not config.security.username:
+        raise RuntimeError("缺少安全配置: username")
+    if password_is_hashed(config.security.password):
+        parts = config.security.password.split("$")
+        if len(parts) != 4:
+            raise RuntimeError("安全配置不合格: password 哈希格式错误")
+    elif len(config.security.password) < 12:
+        raise RuntimeError("安全配置不合格: password 长度必须至少为 12")
+    if len(config.security.jwt_secret_key) < 32:
+        raise RuntimeError("安全配置不合格: jwt_secret_key 长度必须至少为 32")
+    if not config.llm.api_key:
+        LOGGER.warning("LLM API Key 为空，提示词挖掘接口将无法正常调用上游模型")
+    if not password_is_hashed(config.security.password):
+        LOGGER.warning("当前仍在使用明文 password，建议改为 pbkdf2_sha256 哈希")
+
+
+CONFIG = apply_env_overrides(CONFIG)
+validate_security_config(CONFIG)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -203,6 +298,28 @@ def vault_dir() -> Path:
     path = Path(CONFIG.storage.vault_path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def allowed_storage_roots() -> list[Path]:
+    configured_paths = CONFIG.storage.allowed_export_paths or [CONFIG.storage.vault_path]
+    roots: list[Path] = []
+    for item in configured_paths:
+        path = Path(item)
+        path.mkdir(parents=True, exist_ok=True)
+        roots.append(path.resolve())
+    return roots
+
+
+def path_is_within_allowed_roots(resolved: Path) -> bool:
+    for root in allowed_storage_roots():
+        if resolved.parent == root:
+            return True
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def sanitize_slug(value: str) -> str:
@@ -218,6 +335,13 @@ def current_timestamp() -> str:
 def markdown_file_path(uid: str, title: str) -> Path:
     filename = f"{sanitize_slug(uid or title)}.md"
     return vault_dir() / filename
+
+
+def ensure_vault_path(path: Path) -> Path:
+    resolved = path.resolve()
+    if not path_is_within_allowed_roots(resolved):
+        raise RuntimeError("检测到非法文件路径")
+    return resolved
 
 
 def excerpt_text(text: str, limit: int = 160) -> str:
@@ -355,7 +479,9 @@ def create_access_token(username: str) -> str:
     payload = {
         "sub": username,
         "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(hours=TOKEN_EXPIRE_HOURS)).timestamp()),
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
+        "exp": int((now + timedelta(minutes=TOKEN_EXPIRE_MINUTES)).timestamp()),
     }
     return jwt.encode(
         payload,
@@ -364,16 +490,116 @@ def create_access_token(username: str) -> str:
     )
 
 
+def client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def login_tracker_key(username: str, ip: str) -> str:
+    return f"{username.lower()}@{ip}"
+
+
+def login_state_snapshot(key: str) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    entry = LOGIN_ATTEMPTS.get(key)
+    if entry is None:
+        entry = {"count": 0, "window_started_at": now, "locked_until": None}
+        LOGIN_ATTEMPTS[key] = entry
+        return entry
+    locked_until = entry.get("locked_until")
+    window_started_at = entry.get("window_started_at", now)
+    if locked_until and locked_until <= now:
+        entry["count"] = 0
+        entry["locked_until"] = None
+        entry["window_started_at"] = now
+        return entry
+    if now - window_started_at > timedelta(minutes=LOGIN_WINDOW_MINUTES):
+        entry["count"] = 0
+        entry["locked_until"] = None
+        entry["window_started_at"] = now
+    return entry
+
+
+def ensure_login_allowed(username: str, ip: str) -> None:
+    entry = login_state_snapshot(login_tracker_key(username, ip))
+    locked_until = entry.get("locked_until")
+    now = datetime.now(timezone.utc)
+    if locked_until and locked_until > now:
+        seconds = int((locked_until - now).total_seconds())
+        LOGGER.warning("登录暂时锁定: username=%s ip=%s remaining=%ss", username, ip, seconds)
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="登录尝试过多，请稍后再试")
+
+
+def register_login_failure(username: str, ip: str) -> None:
+    key = login_tracker_key(username, ip)
+    entry = login_state_snapshot(key)
+    entry["count"] += 1
+    if entry["count"] >= LOGIN_MAX_ATTEMPTS:
+        entry["locked_until"] = datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCK_MINUTES)
+        LOGGER.warning("触发登录锁定: username=%s ip=%s", username, ip)
+    else:
+        LOGGER.warning("登录失败: username=%s ip=%s count=%s", username, ip, entry["count"])
+
+
+def clear_login_failures(username: str, ip: str) -> None:
+    LOGIN_ATTEMPTS.pop(login_tracker_key(username, ip), None)
+
+
+def request_scheme(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if forwarded_proto in {"http", "https"}:
+        return forwarded_proto
+    return request.url.scheme.lower()
+
+
+def cookie_secure_flag(request: Request) -> bool:
+    if CONFIG.security.cookie_secure is not None:
+        return CONFIG.security.cookie_secure
+    return request_scheme(request) == "https"
+
+
+def set_auth_cookie(response: Response, token: str, request: Request) -> None:
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=cookie_secure_flag(request),
+        samesite="strict",
+        max_age=TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+
+
+def clear_auth_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        key=AUTH_COOKIE_NAME,
+        httponly=True,
+        secure=cookie_secure_flag(request),
+        samesite="strict",
+        path="/",
+    )
+
+
 async def verify_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(auth_scheme),
 ) -> dict:
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    token = None
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        token = credentials.credentials
+    if token is None:
+        token = request.cookies.get(AUTH_COOKIE_NAME)
+    if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
     try:
         return jwt.decode(
-            credentials.credentials,
+            token,
             CONFIG.security.jwt_secret_key,
             algorithms=[CONFIG.security.jwt_algorithm],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
         )
     except jwt.PyJWTError as exc:
         LOGGER.warning("JWT 校验失败: %s", exc)
@@ -595,7 +821,7 @@ def all_available_tags(conn: sqlite3.Connection) -> list[str]:
 
 
 async def export_prompt_to_markdown(uid: str, title: str, content: str, tags: list[str], category: str, updated_at: str) -> None:
-    file_path = markdown_file_path(uid, title)
+    file_path = ensure_vault_path(markdown_file_path(uid, title))
     raw_markdown = render_markdown_document(title, content, tags, category, updated_at)
     async with aiofiles.open(file_path, "w", encoding="utf-8") as handle:
         await handle.write(raw_markdown)
@@ -687,7 +913,7 @@ async def sync_record_to_file(detail: PromptDetail, previous_uid: str | None = N
         updated_at=detail.updated_at,
     )
     if previous_uid and previous_uid != detail.uid:
-        old_path = markdown_file_path(previous_uid, previous_uid)
+        old_path = ensure_vault_path(markdown_file_path(previous_uid, previous_uid))
         if old_path.exists():
             old_path.unlink()
 
@@ -702,7 +928,7 @@ async def delete_prompt_record(prompt_id: int) -> PromptDetail:
     with conn:
         conn.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
     conn.close()
-    file_path = markdown_file_path(detail.uid, detail.title)
+    file_path = ensure_vault_path(markdown_file_path(detail.uid, detail.title))
     if file_path.exists():
         file_path.unlink()
     return detail
@@ -749,11 +975,38 @@ def import_vault_to_db() -> None:
         conn.close()
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     vault_dir()
     import_vault_to_db()
+    yield
+
+
+app = FastAPI(title="Prompt Mining Engine", version="3.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "font-src 'self' https://cdnjs.cloudflare.com; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'"
+    )
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/", include_in_schema=False)
@@ -762,37 +1015,68 @@ async def serve_index() -> FileResponse:
 
 
 @app.post("/api/login", response_model=LoginResponse)
-async def login(payload: LoginRequest) -> LoginResponse:
-    if payload.username != CONFIG.security.username or payload.password != CONFIG.security.password:
+async def login(payload: LoginRequest, request: Request, response: Response) -> LoginResponse:
+    ip = client_ip(request)
+    ensure_login_allowed(payload.username, ip)
+    if not compare_digest(payload.username, CONFIG.security.username) or not verify_password(
+        payload.password, CONFIG.security.password
+    ):
+        register_login_failure(payload.username, ip)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号或密码错误")
-    return LoginResponse(access_token=create_access_token(payload.username))
+    clear_login_failures(payload.username, ip)
+    token = create_access_token(payload.username)
+    set_auth_cookie(response, token, request)
+    LOGGER.info("登录成功: username=%s ip=%s", payload.username, ip)
+    return LoginResponse(access_token=token)
+
+
+@app.post("/api/logout")
+async def logout(request: Request) -> JSONResponse:
+    response = JSONResponse({"ok": True})
+    clear_auth_cookie(response, request)
+    return response
+
+
+@app.get("/api/session", response_model=SessionResponse)
+async def session(claims: dict = Depends(verify_token)) -> SessionResponse:
+    return SessionResponse(authenticated=True, username=str(claims.get("sub") or ""))
 
 
 @app.get("/api/prompts", response_model=PromptListResponse, dependencies=[Depends(verify_token)])
 async def list_prompts(
     q: str | None = Query(default=None),
     tag: str | None = Query(default=None),
+    limit: int = Query(default=24, ge=1, le=PROMPT_LIST_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
 ) -> PromptListResponse:
     conn = get_conn()
     try:
         conditions: list[str] = []
         values: list[Any] = []
         if q:
+            query_text = q.strip()
+            if len(query_text) > SEARCH_QUERY_MAX_LENGTH:
+                raise HTTPException(status_code=422, detail="搜索关键词过长")
             conditions.append("(title LIKE ? OR content LIKE ?)")
-            like = f"%{q.strip()}%"
+            like = f"%{query_text}%"
             values.extend([like, like])
         if tag:
             conditions.append("tags LIKE ?")
             values.append(f'%"{tag}"%')
 
         sql = "SELECT id, uid, title, tags, category, updated_at, content FROM prompts"
+        count_sql = "SELECT COUNT(*) FROM prompts"
         if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY datetime(updated_at) DESC, id DESC"
-        rows = conn.execute(sql, values).fetchall()
+            where_clause = " WHERE " + " AND ".join(conditions)
+            sql += where_clause
+            count_sql += where_clause
+        sql += " ORDER BY datetime(updated_at) DESC, id DESC LIMIT ? OFFSET ?"
+        rows = conn.execute(sql, [*values, limit, offset]).fetchall()
+        total = int(conn.execute(count_sql, values).fetchone()[0])
         return PromptListResponse(
             items=[row_to_summary(row) for row in rows],
             available_tags=all_available_tags(conn),
+            total=total,
         )
     finally:
         conn.close()

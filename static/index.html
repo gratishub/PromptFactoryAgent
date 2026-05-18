@@ -41,6 +41,7 @@
           saving: false,
           deleting: false,
           mining: false,
+          optimizing: false,
           toast: null,
           prompts: [],
           availableTags: [],
@@ -51,10 +52,25 @@
           currentPrompt: null,
           editor: { title: "", content: "", tagsText: "", category: "" },
           mineKeyword: "",
+          previewVars: {},
         });
 
         const filteredPromptCount = computed(() => state.prompts.length);
         const renderedMarkdown = computed(() => marked.parse(state.editor.content || ""));
+
+        const detectedVars = computed(() => {
+          const matches = (state.editor.content || "").match(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g) || [];
+          return [...new Set(matches.map(v => v.replace(/\{\{\s*|\s*\}\}/g, "")))];
+        });
+
+        const renderedWithVars = computed(() => {
+          let content = state.editor.content || "";
+          for (const v of detectedVars.value) {
+            const val = state.previewVars[v] || `{{ ${v} }}`;
+            content = content.replace(new RegExp(`\\{\\{\\s*${v}\\s*\\}\\}`, "g"), val);
+          }
+          return marked.parse(content);
+        });
 
         function showToast(message, type = "success") {
           state.toast = { message, type };
@@ -287,6 +303,38 @@
           }
         }
 
+        async function optimizePromptContent() {
+          if (!state.editor.content.trim()) {
+            showToast("请先输入提示词内容", "error");
+            return;
+          }
+          state.optimizing = true;
+          try {
+            const response = await apiFetch("/api/optimize-prompt", {
+              method: "POST",
+              body: JSON.stringify({ content: state.editor.content }),
+            });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(body.detail || "优化失败");
+            }
+            state.editor.content = body.content || state.editor.content;
+            if (!state.editor.title && body.title) {
+              state.editor.title = body.title;
+            }
+            if (!state.editor.tagsText && body.tags && body.tags.length > 0) {
+              state.editor.tagsText = body.tags.join(", ");
+            }
+            showToast("优化成功");
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "优化失败", "error");
+            }
+          } finally {
+            state.optimizing = false;
+          }
+        }
+
         function logout() {
           apiFetch("/api/logout", { method: "POST" })
             .catch(() => null)
@@ -367,6 +415,8 @@
           state,
           filteredPromptCount,
           renderedMarkdown,
+          detectedVars,
+          renderedWithVars,
           login,
           logout,
           loadPrompts,
@@ -381,6 +431,7 @@
           toggleTag,
           minePrompt,
           restoreSession,
+          optimizePromptContent,
         };
       },
       template: `
@@ -669,18 +720,45 @@
                       </div>
                       <div>
                         <label class="mb-2 block text-sm font-medium text-slate-600">提示词内容</label>
-                        <textarea
-                          v-model="state.editor.content"
-                          class="min-h-[420px] w-full rounded-[2rem] border border-slate-200 bg-white p-5 font-mono text-sm leading-7 text-slate-800 outline-none transition focus:border-slate-900 whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
-                        ></textarea>
+                        <div class="relative">
+                          <textarea
+                            v-model="state.editor.content"
+                            class="min-h-[420px] w-full rounded-[2rem] border border-slate-200 bg-white p-5 font-mono text-sm leading-7 text-slate-800 outline-none transition focus:border-slate-900 whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                          ></textarea>
+                          <button
+                            class="absolute bottom-4 right-4 rounded-2xl bg-gradient-to-r from-violet-600 to-purple-600 px-4 py-2.5 text-sm font-medium text-white shadow-lg shadow-violet-200 hover:from-violet-700 hover:to-purple-700 disabled:opacity-60"
+                            :disabled="state.optimizing"
+                            @click="optimizePromptContent"
+                          >
+                            {{ state.optimizing ? '优化中...' : '✨ AI 魔法优化' }}
+                          </button>
+                        </div>
                       </div>
                     </div>
 
                     <article
                       v-else
-                      class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
-                      v-html="renderedMarkdown"
-                    ></article>
+                      class="space-y-4"
+                    >
+                      <div v-if="detectedVars.length > 0" class="rounded-[1.5rem] border border-violet-200 bg-gradient-to-r from-violet-50 to-purple-50 p-5">
+                        <p class="mb-3 text-xs font-medium uppercase tracking-widest text-violet-400">动态变量填充</p>
+                        <div class="flex flex-wrap gap-3">
+                          <div v-for="v in detectedVars" :key="v" class="flex items-center gap-2">
+                            <label class="rounded-xl bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm">{{ v }}</label>
+                            <input
+                              v-model="state.previewVars[v]"
+                              type="text"
+                              :placeholder="`{{ ${v} }}`"
+                              class="w-40 rounded-xl border border-violet-200 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-violet-500"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <article
+                        class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                        v-html="detectedVars.length > 0 ? renderedWithVars : renderedMarkdown"
+                      ></article>
+                    </article>
                   </div>
                 </div>
               </div>

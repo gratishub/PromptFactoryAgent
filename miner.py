@@ -194,6 +194,8 @@ class PromptDetail(BaseModel):
     category: str
     raw_markdown: str
     updated_at: str
+    version: int = 1
+    variables: list[str] = Field(default_factory=list)
 
 
 class MinePromptResponse(BaseModel):
@@ -351,8 +353,31 @@ def excerpt_text(text: str, limit: int = 160) -> str:
     return normalized[: limit - 1].rstrip() + "…"
 
 
+JINJA_VAR_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+
+
+def extract_jinja_variables(content: str) -> list[str]:
+    return sorted(set(JINJA_VAR_PATTERN.findall(content)))
+
+
 def tags_to_json(tags: list[str]) -> str:
     return json.dumps(sorted(set(tags)), ensure_ascii=False)
+
+
+def variables_to_json(vars: list[str]) -> str:
+    return json.dumps(vars, ensure_ascii=False)
+
+
+def variables_from_json(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except json.JSONDecodeError:
+        LOGGER.warning("variables JSON 解析失败，已回退为空列表")
+    return []
 
 
 def tags_from_json(value: str | None) -> list[str]:
@@ -391,6 +416,48 @@ def front_matter_from_markdown(text: str) -> tuple[dict[str, Any], str]:
     return {}, text
 
 
+def init_db() -> None:
+    conn = get_conn()
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                category TEXT NOT NULL,
+                raw_markdown TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                version INTEGER DEFAULT 1,
+                variables TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
+                title, content, content='prompts', content_rowid='id'
+            )
+            """
+        )
+
+    try:
+        with conn:
+            conn.execute("ALTER TABLE prompts ADD COLUMN version INTEGER DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        with conn:
+            conn.execute("ALTER TABLE prompts ADD COLUMN variables TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    conn.close()
+
+
 def parse_legacy_markdown(text: str) -> dict[str, Any]:
     title_match = re.search(r"^##\s+(.+)$", text, flags=re.MULTILINE)
     title = title_match.group(1).strip() if title_match else "Untitled Prompt"
@@ -423,6 +490,13 @@ def parse_markdown_document(path: Path) -> dict[str, Any]:
         tags = [str(item).strip() for item in tags if str(item).strip()]
         category = str(metadata.get("category") or infer_category_from_tags(tags)).strip() or "通用"
         content = body.strip() or raw.strip()
+        version = metadata.get("version", 1)
+        variables = metadata.get("variables", [])
+        if isinstance(variables, str):
+            try:
+                variables = json.loads(variables)
+            except json.JSONDecodeError:
+                variables = []
         return {
             "uid": path.stem,
             "title": title,
@@ -430,6 +504,8 @@ def parse_markdown_document(path: Path) -> dict[str, Any]:
             "category": category,
             "content": content,
             "raw_markdown": raw,
+            "version": version,
+            "variables": variables,
             "mtime": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
         }
 
@@ -439,13 +515,16 @@ def parse_markdown_document(path: Path) -> dict[str, Any]:
     return legacy
 
 
-def render_markdown_document(title: str, content: str, tags: list[str], category: str, updated_at: str) -> str:
+def render_markdown_document(title: str, content: str, tags: list[str], category: str, updated_at: str, version: int = 1, variables: list[str] | None = None) -> str:
     front_matter = {
         "title": title,
         "category": category,
         "tags": tags,
         "updated_at": updated_at,
+        "version": version,
     }
+    if variables:
+        front_matter["variables"] = variables
     return (
         "---\n"
         f"{yaml.safe_dump(front_matter, allow_unicode=True, sort_keys=False)}"
@@ -809,6 +888,8 @@ def row_to_detail(row: sqlite3.Row) -> PromptDetail:
         category=row["category"],
         raw_markdown=row["raw_markdown"],
         updated_at=row["updated_at"],
+        version=row["version"] if "version" in row and row["version"] is not None else 1,
+        variables=variables_from_json(row["variables"]) if "variables" in row else [],
     )
 
 
@@ -820,9 +901,9 @@ def all_available_tags(conn: sqlite3.Connection) -> list[str]:
     return sorted(tag_set)
 
 
-async def export_prompt_to_markdown(uid: str, title: str, content: str, tags: list[str], category: str, updated_at: str) -> None:
+async def export_prompt_to_markdown(uid: str, title: str, content: str, tags: list[str], category: str, updated_at: str, version: int = 1, variables: list[str] | None = None) -> None:
     file_path = ensure_vault_path(markdown_file_path(uid, title))
-    raw_markdown = render_markdown_document(title, content, tags, category, updated_at)
+    raw_markdown = render_markdown_document(title, content, tags, category, updated_at, version, variables)
     async with aiofiles.open(file_path, "w", encoding="utf-8") as handle:
         await handle.write(raw_markdown)
 
@@ -834,12 +915,22 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
     if not any(tag.startswith("#分类/") for tag in tags):
         tags = sorted(set(tags + [f"#分类/{category}"]))
     updated_at = current_timestamp()
+    variables = extract_jinja_variables(payload.content)
+    existing_version = 1
+    if prompt_id is not None:
+        conn_check = get_conn()
+        existing_row = conn_check.execute("SELECT version, variables FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
+        conn_check.close()
+        if existing_row:
+            existing_version = existing_row["version"] or 1
     raw_markdown = payload.raw_markdown or render_markdown_document(
         payload.title,
         payload.content,
         tags,
         category,
         updated_at,
+        existing_version,
+        variables if variables else None,
     )
 
     conn = get_conn()
@@ -848,15 +939,17 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
             if prompt_id is None:
                 conn.execute(
                     """
-                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(uid) DO UPDATE SET
                       title = excluded.title,
                       content = excluded.content,
                       tags = excluded.tags,
                       category = excluded.category,
                       raw_markdown = excluded.raw_markdown,
-                      updated_at = excluded.updated_at
+                      updated_at = excluded.updated_at,
+                      version = excluded.version,
+                      variables = excluded.variables
                     """,
                     (
                         prompt_uid,
@@ -866,6 +959,8 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         category,
                         raw_markdown,
                         updated_at,
+                        existing_version,
+                        variables_to_json(variables) if variables else None,
                     ),
                 )
                 row = conn.execute("SELECT * FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
@@ -876,7 +971,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                 conn.execute(
                     """
                     UPDATE prompts
-                    SET uid = ?, title = ?, content = ?, tags = ?, category = ?, raw_markdown = ?, updated_at = ?
+                    SET uid = ?, title = ?, content = ?, tags = ?, category = ?, raw_markdown = ?, updated_at = ?, version = ?, variables = ?
                     WHERE id = ?
                     """,
                     (
@@ -887,6 +982,8 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         category,
                         raw_markdown,
                         updated_at,
+                        existing_version,
+                        variables_to_json(variables) if variables else None,
                         prompt_id,
                     ),
                 )
@@ -904,6 +1001,8 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
 
 
 async def sync_record_to_file(detail: PromptDetail, previous_uid: str | None = None) -> None:
+    version = getattr(detail, 'version', 1)
+    variables = getattr(detail, 'variables', None)
     await export_prompt_to_markdown(
         uid=detail.uid,
         title=detail.title,
@@ -911,6 +1010,8 @@ async def sync_record_to_file(detail: PromptDetail, previous_uid: str | None = N
         tags=detail.tags,
         category=detail.category,
         updated_at=detail.updated_at,
+        version=version,
+        variables=variables,
     )
     if previous_uid and previous_uid != detail.uid:
         old_path = ensure_vault_path(markdown_file_path(previous_uid, previous_uid))
@@ -948,18 +1049,22 @@ def import_vault_to_db() -> None:
             category = parsed["category"] or infer_category_from_tags(tags)
             content = parsed["content"]
             raw_markdown = parsed["raw_markdown"]
+            version = parsed.get("version", 1)
+            variables = parsed.get("variables", [])
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(uid) DO UPDATE SET
                       title = excluded.title,
                       content = excluded.content,
                       tags = excluded.tags,
                       category = excluded.category,
                       raw_markdown = excluded.raw_markdown,
-                      updated_at = excluded.updated_at
+                      updated_at = excluded.updated_at,
+                      version = excluded.version,
+                      variables = excluded.variables
                     """,
                     (
                         parsed["uid"],
@@ -969,6 +1074,8 @@ def import_vault_to_db() -> None:
                         category,
                         raw_markdown,
                         file_mtime,
+                        version,
+                        variables_to_json(variables) if variables else None,
                     ),
                 )
     finally:
@@ -1057,12 +1164,12 @@ async def list_prompts(
             query_text = q.strip()
             if len(query_text) > SEARCH_QUERY_MAX_LENGTH:
                 raise HTTPException(status_code=422, detail="搜索关键词过长")
-            conditions.append("(title LIKE ? OR content LIKE ?)")
-            like = f"%{query_text}%"
-            values.extend([like, like])
+            fts_query = query_text.replace('"', '""')
+            conditions.append("id IN (SELECT rowid FROM prompts_fts WHERE prompts_fts MATCH ?)")
+            values.append(f'"{fts_query}"')
         if tag:
-            conditions.append("tags LIKE ?")
-            values.append(f'%"{tag}"%')
+            conditions.append("EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)")
+            values.append(tag)
 
         sql = "SELECT id, uid, title, tags, category, updated_at, content FROM prompts"
         count_sql = "SELECT COUNT(*) FROM prompts"

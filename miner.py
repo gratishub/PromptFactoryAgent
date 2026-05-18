@@ -142,6 +142,18 @@ class PromptLLMOutput(BaseModel):
         return sorted(set(tags)) or ["#分类/通用"]
 
 
+class OptimizePromptRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+
+    @field_validator("content")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("content 不能为空")
+        return normalized
+
+
 class PromptEditorPayload(BaseModel):
     title: str = Field(..., min_length=1)
     content: str = Field(..., min_length=1)
@@ -781,7 +793,7 @@ def derive_title(keyword: str, text: str) -> str:
 
 
 def extract_json_object(text: str) -> str:
-    fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    fenced_match = re.search(r'```json\s*(\{.*?\})\s*```', text, flags=re.DOTALL | re.IGNORECASE)
     if fenced_match:
         return fenced_match.group(1)
     start = text.find("{")
@@ -789,6 +801,34 @@ def extract_json_object(text: str) -> str:
     if start == -1 or end == -1 or end <= start:
         raise ValueError("模型返回中未找到 JSON 对象。")
     return text[start : end + 1]
+
+
+FEWSHOT_SYSTEM = (
+    "你是 Prompt-Factory-Agent，一名顶级提示词工程与数据清洗专家。"
+    "你必须只返回一个合法 JSON 对象。"
+    'JSON 只允许包含字段: "title", "content", "tags"。'
+    '其中 "content" 必须严格包含【角色设定】、【上下文】、【核心任务】、【输出格式】四个部分。'
+    '其中 "tags" 必须是数组，且至少包含一个 "#分类/xxx" 标签。'
+)
+
+FEWSHOT_EXAMPLE_INPUT = (
+    "帮我写一个代码审查的prompt。用户想要一个能自动审查代码、指出潜在bug和改进建议的助手。\n"
+    "希望它能用中文输出，给出具体建议，不要太啰嗦。"
+)
+
+FEWSHOT_EXAMPLE_OUTPUT = (
+    '{"title":"高级代码审查助手",'
+    '"content":"【角色设定】\\n你是一名资深软件工程师兼代码审查专家，拥有十年以上的编程经验，'
+    '熟悉多种编程语言和最佳实践。\\n\\n【上下文】\\n- 用户输入为一段源代码，可能包含一个或多个文件。'
+    '\\n- 需要在不修改原始逻辑的前提下，发现潜在问题、安全隐患和可优化之处。\\n'
+    '- 对信息不足之处保持保守，不随意推测未给出的业务场景。\\n\\n【核心任务】\\n'
+    '1. 逐行分析代码结构，识别逻辑错误和边界条件遗漏。\\n'
+    '2. 检查安全漏洞（如SQL注入、缓冲区溢出敏感操作）。\\n'
+    '3. 评估代码可读性和可维护性。\\n'
+    '4. 提出具体、可执行的改进建议，并标注优先级。\\n\\n【输出格式】\\n'
+    '输出一个结构化报告，包含：问题列表（位置+描述+建议）、总体评价、改进优先级（高/中/低）。',
+    '"tags":["#分类/编程","#主题/CodeReview","#模型/GPT"]}'
+)
 
 
 async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> PromptLLMOutput:
@@ -801,7 +841,7 @@ async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> Pr
         title=fallback_title,
         content=(
             "【角色设定】\n"
-            f"你是一名围绕“{keyword}”主题工作的高级提示词执行助手。\n\n"
+            f'你是一名围绕"{keyword}"主题工作的高级提示词执行助手。\n\n'
             "【上下文】\n"
             "- 输入来源为全网检索后的网页文本，已经过基础去噪。\n"
             "- 需要在不歪曲原始意图的前提下，将信息重构为可直接执行的高级提示词。\n"
@@ -820,35 +860,36 @@ async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> Pr
     )
 
     client = AsyncOpenAI(api_key=config.llm.api_key, base_url=config.llm.base_url)
-    system_prompt = (
-        "你是 Prompt-Factory-Agent，一名顶级提示词工程与数据清洗专家。"
-        "你必须只返回一个合法 JSON 对象。"
-        'JSON 只允许包含字段: "title", "content", "tags"。'
-        '其中 "content" 必须严格包含【角色设定】、【上下文】、【核心任务】、【输出格式】四个部分。'
-        '其中 "tags" 必须是数组，且至少包含一个 "#分类/xxx" 标签。'
-    )
-    user_prompt = (
-        f"关键词: {keyword}\n"
-        "请基于以下已去噪的网页文本，提炼并重构为高级提示词。\n\n"
-        f"网页文本:\n{excerpt}"
-    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": FEWSHOT_SYSTEM},
+        {"role": "user", "content": f"示例输入：\n{FEWSHOT_EXAMPLE_INPUT}\n\n示例输出：\n{FEWSHOT_EXAMPLE_OUTPUT}"},
+        {"role": "assistant", "content": FEWSHOT_EXAMPLE_OUTPUT},
+        {"role": "user", "content": (
+            f"关键词: {keyword}\n"
+            "请基于以下已去噪的网页文本，提炼并重构为高级提示词。\n\n"
+            f"网页文本:\n{excerpt}"
+        )},
+    ]
 
-    try:
-        response = await client.chat.completions.create(
-            model=config.llm.model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-        message = response.choices[0].message.content or ""
-        payload = json.loads(extract_json_object(message))
-        return PromptLLMOutput.model_validate(payload)
-    except Exception as exc:
-        LOGGER.exception("LLM 重构失败，回退到本地占位重构: %s", exc)
-        return fallback_payload
+    for attempt in range(3):
+        try:
+            response = await client.chat.completions.create(
+                model=config.llm.model_name,
+                messages=messages,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            message = response.choices[0].message.content or ""
+            payload = json.loads(extract_json_object(message))
+            return PromptLLMOutput.model_validate(payload)
+        except Exception as exc:
+            LOGGER.warning("LLM 调用失败（第 %s 次尝试）: %s", attempt + 1, exc)
+            if attempt < 2:
+                messages.append({"role": "user", "content": f"JSON 解析失败，请修复格式后重新输出一个合法的 JSON 对象。错误信息：{exc}"})
+                continue
+            LOGGER.exception("LLM 重构失败，回退到本地占位重构: %s", exc)
+            return fallback_payload
+    return fallback_payload
 
 
 async def fetch_search_text(keyword: str, config: AppConfig) -> str:
@@ -1245,6 +1286,44 @@ async def mine_prompt(payload: MinePromptRequest) -> MinePromptResponse:
     except Exception as exc:
         LOGGER.exception("提示词挖掘失败: %s", exc)
         raise HTTPException(status_code=500, detail=f"提示词挖掘失败: {exc}") from exc
+
+
+@app.post("/api/optimize-prompt", response_model=PromptLLMOutput, dependencies=[Depends(verify_token)])
+async def optimize_prompt(payload: OptimizePromptRequest) -> PromptLLMOutput:
+    client = AsyncOpenAI(api_key=CONFIG.llm.api_key, base_url=CONFIG.llm.base_url)
+    system_msg = (
+        "你是 Prompt-Factory-Agent，一名顶级提示词工程专家。"
+        '你必须只返回一个合法 JSON 对象，包含 "title"、"content"、"tags" 三个字段。'
+        '"content" 必须严格包含【角色设定】、【上下文】、【核心任务】、【输出格式】四个部分。'
+        '"tags" 必须是数组，且至少包含一个 "#分类/xxx" 标签。'
+        "请将用户输入的口语化描述扩写为结构完整、可直接使用的高级 Prompt。"
+    )
+    user_msg = f"口语化需求：{payload.content}"
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": FEWSHOT_SYSTEM},
+        {"role": "user", "content": f"示例输入：\n{FEWSHOT_EXAMPLE_INPUT}\n\n示例输出：\n{FEWSHOT_EXAMPLE_OUTPUT}"},
+        {"role": "assistant", "content": FEWSHOT_EXAMPLE_OUTPUT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    for attempt in range(3):
+        try:
+            response = await client.chat.completions.create(
+                model=CONFIG.llm.model_name,
+                messages=messages,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            message = response.choices[0].message.content or ""
+            result = json.loads(extract_json_object(message))
+            return PromptLLMOutput.model_validate(result)
+        except Exception as exc:
+            LOGGER.warning("optimize-prompt 调用失败（第 %s 次尝试）: %s", attempt + 1, exc)
+            if attempt < 2:
+                messages.append({"role": "user", "content": f"JSON 解析失败，请修复格式后重新输出一个合法的 JSON 对象。错误信息：{exc}"})
+                continue
+            raise HTTPException(status_code=500, detail=f"Prompt 优化失败: {exc}") from exc
 
 
 def main() -> None:

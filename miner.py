@@ -112,6 +112,7 @@ class SessionResponse(BaseModel):
 
 class MinePromptRequest(BaseModel):
     keyword: str = Field(..., min_length=1)
+    vault_id: int | None = None
 
     @field_validator("keyword")
     @classmethod
@@ -527,6 +528,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE prompts ADD COLUMN variables TEXT")
         except sqlite3.OperationalError:
             pass
+
+    conn.execute("UPDATE prompts SET vault_id = ? WHERE vault_id IS NULL", (default_vault_id,))
 
     fts_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='prompts_fts'"
@@ -1490,6 +1493,7 @@ async def mine_prompt(payload: MinePromptRequest) -> MinePromptResponse:
             content=prompt.content,
             tags=prompt.tags,
             category=category,
+            vault_id=payload.vault_id,
         )
         detail = upsert_prompt_record(editor_payload)
         await sync_record_to_file(detail)

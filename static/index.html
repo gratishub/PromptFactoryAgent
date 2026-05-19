@@ -12,6 +12,11 @@
     href="/static/github.css"
   />
   <script src="/static/highlight.js"></script>
+  <style>
+    .prose ul { list-style: disc; padding-left: 1.5em; }
+    .prose ol { list-style: decimal; padding-left: 1.5em; }
+    .prose li { margin-top: 0.25em; margin-bottom: 0.25em; }
+  </style>
 </head>
 <body class="min-h-screen bg-slate-50 text-slate-800 overflow-x-hidden">
   <div id="app"></div>
@@ -300,7 +305,7 @@
           try {
             const response = await apiFetch("/api/mine-prompt", {
               method: "POST",
-              body: JSON.stringify({ keyword: state.mineKeyword.trim() }),
+              body: JSON.stringify({ keyword: state.mineKeyword.trim(), vault_id: state.currentVaultId }),
             });
             const body = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -923,7 +928,7 @@
                         </div>
                       </div>
                       <article
-                        class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                        class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm break-words [overflow-wrap:anywhere]"
                         v-html="detectedVars.length > 0 ? renderedWithVars : renderedMarkdown"
                       ></article>
                     </article>

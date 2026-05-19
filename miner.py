@@ -553,26 +553,6 @@ def render_markdown_document(title: str, content: str, tags: list[str], category
     )
 
 
-def init_db() -> None:
-    conn = get_conn()
-    with conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS prompts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uid TEXT NOT NULL UNIQUE,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                tags TEXT NOT NULL,
-                category TEXT NOT NULL,
-                raw_markdown TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-    conn.close()
-
-
 def create_access_token(username: str) -> str:
     now = datetime.now(timezone.utc)
     payload = {
@@ -711,16 +691,8 @@ def ensure_trailing_slash(url: str) -> str:
 
 def build_search_url(keyword: str, config: AppConfig) -> str:
     encoded_query = quote(f"{keyword}{SEARCH_SUFFIX}")
-    base = config.crawler.jina_base_url
-    if "{keyword}" in base:
-        return base.format(keyword=encoded_query)
-    if base.endswith("?q="):
-        return f"{base}{encoded_query}"
-    if "duckduckgo.com" in base:
-        separator = "&" if "?" in base and not base.endswith("?") else ""
-        return f"{base}{separator}{encoded_query}"
-    target = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-    return f"{ensure_trailing_slash(base)}{target}"
+    base = ensure_trailing_slash(config.crawler.jina_base_url)
+    return f"{base}{encoded_query}"
 
 
 def clean_text(text: str) -> str:
@@ -841,7 +813,7 @@ FEWSHOT_EXAMPLE_OUTPUT = (
 
 async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> PromptLLMOutput:
     denoised = strip_noise(raw_text)
-    excerpt = denoised[:3000]
+    excerpt = denoised[:12000]
     fallback_category = infer_category(keyword, excerpt)
     fallback_tags = infer_tags(keyword, excerpt, fallback_category)
     fallback_title = derive_title(keyword, excerpt)
@@ -851,14 +823,15 @@ async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> Pr
             "【角色设定】\n"
             f'你是一名围绕"{keyword}"主题工作的高级提示词执行助手。\n\n'
             "【上下文】\n"
-            "- 输入来源为全网检索后的网页文本，已经过基础去噪。\n"
-            "- 需要在不歪曲原始意图的前提下，将信息重构为可直接执行的高级提示词。\n"
-            "- 对信息不足之处保持保守，不编造具体事实。\n\n"
+            "- 输入文本是由 Jina Search 聚合的多个相关网页的全文内容。\n"
+            "- 请综合对比这些来源，提取其中质量最高、结构最完整的核心思想。\n"
+            "- 过滤掉过时的或质量低下的变体，只保留最有价值的指令和约束。\n"
+            "- 需要在不歪曲原始意图的前提下，将信息重构为可直接执行的高级提示词。\n\n"
             "【核心任务】\n"
             "1. 理解用户目标与场景。\n"
-            "2. 从原始网页文本中抽取高价值指令、约束、角色和输出要求。\n"
-            "3. 清除导航、广告、重复描述与无关噪声。\n"
-            "4. 将提炼后的内容重构为稳定、清晰、可复用的高级 Prompt。\n\n"
+            "2. 从聚合网页文本中抽取高价值指令、约束、角色和输出要求。\n"
+            "3. 过滤掉导航、广告、重复描述、低质量变体与无关噪声。\n"
+            "4. 将提炼后的内容重构为稳定、清晰、可复用的终极高级 Prompt。\n\n"
             "【输出格式】\n"
             "请输出一个结构化结果，必要时使用标题、列表、步骤编号与清晰结论。\n\n"
             "【原始文本摘要】\n"
@@ -874,7 +847,9 @@ async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> Pr
         {"role": "assistant", "content": FEWSHOT_EXAMPLE_OUTPUT},
         {"role": "user", "content": (
             f"关键词: {keyword}\n"
-            "请基于以下已去噪的网页文本，提炼并重构为高级提示词。\n\n"
+            "输入文本是由 Jina Search 聚合的多个相关网页的全文内容。"
+            "请综合对比这些来源，提取其中质量最高、结构最完整的核心思想，"
+            "并重构为一个终极的高级提示词。过滤掉过时的或质量低下的变体。\n\n"
             f"网页文本:\n{excerpt}"
         )},
     ]
@@ -902,10 +877,13 @@ async def rewrite_with_llm(raw_text: str, keyword: str, config: AppConfig) -> Pr
 
 async def fetch_search_text(keyword: str, config: AppConfig) -> str:
     url = build_search_url(keyword, config)
-    headers = {"User-Agent": "prompt-mining-engine/3.0"}
+    headers = {
+        "User-Agent": "prompt-mining-engine/3.0",
+        "X-Return-Format": "markdown",
+    }
     if config.crawler.jina_api_key:
         headers["Authorization"] = f"Bearer {config.crawler.jina_api_key}"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
         try:
             response = await client.get(url, headers=headers)
             response.raise_for_status()
@@ -930,11 +908,11 @@ def row_to_summary(row: sqlite3.Row) -> PromptListItem:
 def row_to_detail(row: sqlite3.Row) -> PromptDetail:
     try:
         ver = int(row["version"]) if row["version"] is not None else 1
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, IndexError, TypeError, ValueError):
         ver = 1
     try:
         vars_val = variables_from_json(row["variables"]) if row["variables"] is not None else []
-    except (KeyError, TypeError):
+    except (KeyError, IndexError, TypeError):
         vars_val = []
     return PromptDetail(
         id=row["id"],

@@ -15,7 +15,7 @@ llm:
   model_name: "MiniMax-M2.7"
 
 crawler:
-  jina_base_url: "https://r.jina.ai/https://html.duckduckgo.com/html/?q="
+  jina_base_url: "https://s.jina.ai/"
   jina_api_key: ""
 
 storage:

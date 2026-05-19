@@ -383,9 +383,9 @@
           }
         }
 
-        async function copyPrompt() {
+        async function copyPrompt(content) {
           try {
-            await navigator.clipboard.writeText(interpolatedContent.value || "");
+            await navigator.clipboard.writeText(content || interpolatedContent.value || "");
             showToast("已复制提示词");
           } catch (error) {
             showToast("复制失败", "error");
@@ -946,7 +946,7 @@
                     <div class="mt-5 text-xs text-slate-400">
                       最近更新：{{ new Date(item.updated_at).toLocaleString() }}
                     </div>
-                    <button @click.stop="state.editor.content = item.content; copyPrompt();" class="absolute bottom-4 right-4 p-2 rounded-xl bg-white border border-slate-200 text-slate-500 shadow-sm opacity-0 group-hover:opacity-100 hover:text-slate-900 hover:border-slate-400 transition-all duration-200 z-10" title="一键快速复制">
+                    <button @click.stop="copyPrompt(item.content)" class="absolute bottom-4 right-4 p-2 rounded-xl bg-white border border-slate-200 text-slate-500 shadow-sm opacity-0 group-hover:opacity-100 hover:text-slate-900 hover:border-slate-400 transition-all duration-200 z-10" title="一键快速复制">
                       <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                     </button>
                   </article>
@@ -1007,7 +1007,7 @@
                       </button>
                       <button
                         class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
-                        @click="copyPrompt"
+                        @click="copyPrompt()"
                       >
                         复制
                       </button>

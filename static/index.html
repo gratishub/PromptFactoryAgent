@@ -48,6 +48,12 @@
           mineKeyword: "",
           previewVars: {},
           variableValues: {},
+          vaults: [],
+          currentVaultId: null,
+          showVaultManager: false,
+          newVaultName: "",
+          newVaultSlug: "",
+          vaultManagerError: null,
         });
 
         const filteredPromptCount = computed(() => state.prompts.length);
@@ -96,6 +102,8 @@
           state.drawerOpen = false;
           state.currentPrompt = null;
           state.variableValues = {};
+          state.vaults = [];
+          state.currentVaultId = null;
         }
 
         async function apiFetch(url, options = {}) {
@@ -138,6 +146,7 @@
             }
             state.authenticated = true;
             state.loginForm.password = "";
+            await loadVaults();
             await loadPrompts(false);
             showToast("登录成功");
           } catch (error) {
@@ -154,6 +163,7 @@
             const params = new URLSearchParams();
             if (state.search.trim()) params.set("q", state.search.trim());
             if (state.selectedTag) params.set("tag", state.selectedTag);
+            if (state.currentVaultId) params.set("vault_id", String(state.currentVaultId));
             params.set("limit", "60");
             params.set("offset", "0");
             const response = await apiFetch(`/api/prompts?${params.toString()}`);
@@ -220,6 +230,7 @@
               content: state.editor.content,
               tags: tagsFromText(state.editor.tagsText),
               category: state.editor.category || "通用",
+              vault_id: state.currentVaultId,
             };
             const isUpdate = !!(state.currentPrompt && state.currentPrompt.id);
             const response = await apiFetch(
@@ -358,6 +369,92 @@
             });
         }
 
+        async function loadVaults() {
+          try {
+            const response = await apiFetch("/api/vaults");
+            const payload = await response.json().catch(() => []);
+            if (!response.ok) throw new Error(payload.detail || "加载知识库失败");
+            state.vaults = payload || [];
+            if (state.vaults.length > 0) {
+              if (!state.currentVaultId) {
+                state.currentVaultId = state.vaults[0].id;
+              } else {
+                const stillExists = state.vaults.some(v => v.id === state.currentVaultId);
+                if (!stillExists) {
+                  state.currentVaultId = state.vaults[0].id;
+                }
+              }
+            }
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "加载知识库失败", "error");
+            }
+          }
+        }
+
+        async function createVault() {
+          if (!state.newVaultName.trim() || !state.newVaultSlug.trim()) {
+            state.vaultManagerError = "名称和标识符不能为空";
+            return;
+          }
+          state.vaultManagerError = null;
+          try {
+            const response = await apiFetch("/api/vaults", {
+              method: "POST",
+              body: JSON.stringify({ name: state.newVaultName.trim(), slug: state.newVaultSlug.trim() }),
+            });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(body.detail || "创建失败");
+            }
+            state.newVaultName = "";
+            state.newVaultSlug = "";
+            await loadVaults();
+            showToast("知识库创建成功");
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              state.vaultManagerError = error.message || "创建失败";
+            }
+          }
+        }
+
+        async function deleteVault(vaultId) {
+          if (!window.confirm("确认删除该知识库？其中的所有提示词将被永久移除。")) return;
+          try {
+            const response = await apiFetch(`/api/vaults/${vaultId}`, { method: "DELETE" });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(body.detail || "删除失败");
+            }
+            if (state.currentVaultId === vaultId) {
+              state.currentVaultId = null;
+            }
+            await loadVaults();
+            await loadPrompts();
+            showToast("知识库已删除");
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "删除失败", "error");
+            }
+          }
+        }
+
+        function openVaultManager() {
+          state.vaultManagerError = null;
+          state.newVaultName = "";
+          state.newVaultSlug = "";
+          state.showVaultManager = true;
+        }
+
+        function vaultSlugFromName() {
+          if (state.newVaultSlug) return;
+          state.newVaultSlug = state.newVaultName.trim()
+            .toLowerCase()
+            .replace(/[^\w\-.一-鿿]+/g, "-")
+            .replace(/-{2,}/g, "-")
+            .replace(/^-|-$/g, "");
+        }
+
         function closeDrawer() {
           state.drawerOpen = false;
         }
@@ -400,6 +497,15 @@
           }
         );
 
+        watch(
+          () => state.currentVaultId,
+          async (newId) => {
+            if (newId && state.authenticated) {
+              await loadPrompts();
+            }
+          }
+        );
+
         async function restoreSession() {
           try {
             const response = await apiFetch("/api/session");
@@ -407,6 +513,7 @@
               throw new Error("unauthorized");
             }
             state.authenticated = true;
+            await loadVaults();
             await loadPrompts(true);
           } catch (error) {
             clearSession();
@@ -447,6 +554,11 @@
           minePrompt,
           restoreSession,
           optimizePromptContent,
+          loadVaults,
+          createVault,
+          deleteVault,
+          openVaultManager,
+          vaultSlugFromName,
         };
       },
       template: `
@@ -508,6 +620,28 @@
                     <div class="hidden sm:block text-xs uppercase tracking-[0.35em] text-slate-400">Atom Workspace</div>
                     <div class="text-lg font-semibold text-slate-900">Prompt Vault</div>
                   </div>
+                </div>
+
+                <div class="flex items-center gap-2">
+                  <select
+                    v-model="state.currentVaultId"
+                    class="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm font-medium text-slate-700 outline-none transition focus:border-slate-900 appearance-none cursor-pointer"
+                    style="background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2216%22 height=%2216%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%23475569%22 stroke-width=%222%22><path d=%22m6 9 6 6 6-6%22/></svg>');background-repeat:no-repeat;background-position:right 0.75rem center;padding-right:2.25rem;"
+                  >
+                    <option v-for="v in state.vaults" :key="v.id" :value="v.id">
+                      {{ v.name }} ({{ v.prompt_count }})
+                    </option>
+                  </select>
+                  <button
+                    class="flex h-11 w-11 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-500 hover:border-slate-900 hover:text-slate-900 transition"
+                    title="知识库管理"
+                    @click="openVaultManager"
+                  >
+                    <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="12" cy="12" r="3"></circle>
+                      <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path>
+                    </svg>
+                  </button>
                 </div>
 
                 <div class="relative order-last w-full md:order-none md:flex-1">
@@ -793,6 +927,72 @@
                         v-html="detectedVars.length > 0 ? renderedWithVars : renderedMarkdown"
                       ></article>
                     </article>
+                  </div>
+                </div>
+              </div>
+            </transition>
+
+            <transition name="fade">
+              <div v-if="state.showVaultManager" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 backdrop-blur-[2px] p-4">
+                <div class="w-full max-w-lg rounded-[2rem] border border-white/60 bg-white/90 p-8 shadow-2xl shadow-slate-300/60 backdrop-blur-xl">
+                  <div class="flex items-center justify-between mb-6">
+                    <div>
+                      <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Manage</p>
+                      <h2 class="mt-2 text-2xl font-semibold text-slate-900">知识库管理</h2>
+                    </div>
+                    <button
+                      class="rounded-2xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
+                      @click="state.showVaultManager = false"
+                    >
+                      关闭
+                    </button>
+                  </div>
+
+                  <div class="space-y-3 mb-6">
+                    <div v-for="v in state.vaults" :key="v.id" class="flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                      <div>
+                        <p class="text-sm font-semibold text-slate-900">{{ v.name }}</p>
+                        <p class="text-xs text-slate-400">slug: {{ v.slug }} · {{ v.prompt_count }} 条提示词</p>
+                      </div>
+                      <button
+                        v-if="v.id !== 1"
+                        class="rounded-xl border border-rose-200 bg-white px-3 py-1.5 text-xs font-medium text-rose-600 hover:bg-rose-50 transition"
+                        @click="deleteVault(v.id)"
+                      >
+                        删除
+                      </button>
+                      <span v-else class="rounded-xl bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-400">
+                        默认
+                      </span>
+                    </div>
+                  </div>
+
+                  <div class="border-t border-slate-200 pt-6">
+                    <p class="mb-4 text-sm font-semibold text-slate-700">新建知识库</p>
+                    <div v-if="state.vaultManagerError" class="mb-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                      {{ state.vaultManagerError }}
+                    </div>
+                    <div class="space-y-3">
+                      <input
+                        v-model="state.newVaultName"
+                        @input="vaultSlugFromName"
+                        type="text"
+                        placeholder="知识库名称"
+                        class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
+                      />
+                      <input
+                        v-model="state.newVaultSlug"
+                        type="text"
+                        placeholder="标识符 (slug)"
+                        class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
+                      />
+                      <button
+                        class="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white hover:bg-slate-800 transition"
+                        @click="createVault"
+                      >
+                        新建知识库
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>

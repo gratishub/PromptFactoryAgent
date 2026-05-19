@@ -49,7 +49,7 @@
           drawerOpen: false,
           drawerMode: "preview",
           currentPrompt: null,
-          editor: { title: "", content: "", tagsText: "", category: "" },
+          editor: { title: "", content: "", tags: [], category: "" },
           mineKeyword: "",
           previewVars: {},
           variableValues: {},
@@ -63,9 +63,22 @@
           versionHistory: [],
           viewingHistoryVersion: null,
           showHistoryPanel: false,
+          showTagDropdown: false,
         });
 
         const filteredPromptCount = computed(() => state.prompts.length);
+
+        const filteredTags = computed(() => {
+          const available = state.availableTags;
+          if (!available || !Array.isArray(available)) return [];
+          const input = state.tagInput || "";
+          const currentTags = state.editor.tags;
+          const current = Array.isArray(currentTags) ? currentTags.map(t => t.toLowerCase()) : [];
+          return available.filter(tag =>
+            tag.toLowerCase().includes(input.toLowerCase()) && !current.includes(tag.toLowerCase())
+          );
+        });
+
         const interpolatedContent = computed(() => {
           let content = state.editor.content || "";
           const matches = content.match(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g) || [];
@@ -134,6 +147,7 @@
         }
 
         function tagsFromText(text) {
+          if (!text) return [];
           return text
             .split(",")
             .map((item) => item.trim())
@@ -204,7 +218,7 @@
             state.currentPrompt = payload;
             state.editor.title = payload.title || "";
             state.editor.content = payload.content || "";
-            state.editor.tagsText = tagsToText(payload.tags || []);
+            state.editor.tags = payload.tags || [];
             state.editor.category = payload.category || "";
             state.variableValues = {};
             if (payload.variables && payload.variables.length > 0) {
@@ -227,7 +241,7 @@
           state.currentPrompt = null;
           state.editor.title = "";
           state.editor.content = "";
-          state.editor.tagsText = "";
+          state.editor.tags = [];
           state.editor.category = "通用";
           state.drawerMode = "edit";
           state.drawerOpen = true;
@@ -238,7 +252,7 @@
           state.currentPrompt = null;
           state.editor.title = "";
           state.editor.content = "";
-          state.editor.tagsText = "";
+          state.editor.tags = [];
           state.editor.category = "";
           state.variableValues = {};
           state.drawerOpen = true;
@@ -251,7 +265,7 @@
             const payload = {
               title: state.editor.title,
               content: state.editor.content,
-              tags: tagsFromText(state.editor.tagsText),
+              tags: state.editor.tags || [],
               category: state.editor.category || "通用",
               vault_id: state.currentVaultId,
             };
@@ -277,7 +291,7 @@
             state.currentPrompt = body;
             state.editor.title = body.title;
             state.editor.content = body.content;
-            state.editor.tagsText = tagsToText(body.tags || []);
+            state.editor.tags = body.tags || [];
             state.editor.category = body.category || "";
 
             state.drawerMode = "preview";
@@ -536,6 +550,40 @@
         function toggleTag(tag) {
           state.selectedTag = state.selectedTag === tag ? "" : tag;
           loadPrompts();
+        }
+
+        function addTag(tagValue = null) {
+          const tag = tagValue !== null ? tagValue : state.tagInput.trim();
+          if (tag && !(state.editor.tags || []).map(t => t.toLowerCase()).includes(tag.toLowerCase())) {
+            if (!state.editor.tags) state.editor.tags = [];
+            state.editor.tags.push(tag);
+          }
+          state.tagInput = "";
+        }
+
+        function removeTag(index) {
+          if (state.editor.tags && index >= 0 && index < state.editor.tags.length) {
+            state.editor.tags.splice(index, 1);
+          }
+        }
+
+        function handleTagDelete(e) {
+          if (!state.tagInput && e.key === "Backspace" && state.editor.tags && state.editor.tags.length > 0) {
+            state.editor.tags.pop();
+          }
+        }
+
+        function onTagInputKeydown(e) {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            addTag();
+          } else if (e.key === "Backspace" && !state.tagInput && state.editor.tags && state.editor.tags.length > 0) {
+            state.editor.tags.pop();
+          }
+        }
+
+        function hideTagDropdown() {
+          setTimeout(() => { state.showTagDropdown = false; }, 200);
         }
 
         function handleShortcut(event) {
@@ -830,11 +878,11 @@
                   >
                     <div class="flex items-start justify-between gap-3">
                       <h3 class="line-clamp-2 text-lg font-semibold text-slate-900">{{ item.title }}</h3>
-                      <span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                      <span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 flex-shrink-0">
                         {{ item.category }}
                       </span>
                     </div>
-                    <div class="mt-3 flex flex-wrap gap-2">
+                    <div class="mt-2 flex flex-wrap gap-2">
                       <span
                         v-for="tag in item.tags.slice(0, 3)"
                         :key="tag"
@@ -1006,12 +1054,43 @@
                         </div>
                         <div>
                           <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">标签</label>
-                          <input
-                            v-model="state.editor.tagsText"
-                            type="text"
-                            placeholder="#分类/通用, #主题/Agent"
-                            class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
-                          />
+                          <div class="relative">
+                            <div class="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 focus-within:border-slate-900 focus-within:ring-1 focus-within:ring-slate-900 transition min-h-[42px]">
+                              <span
+                                v-for="(tag, index) in (state.editor.tags || [])"
+                                :key="tag"
+                                class="inline-flex items-center gap-1 bg-blue-50 text-blue-700 px-2 py-1 rounded-md text-sm"
+                              >
+                                {{ tag }}
+                                <button @click="removeTag(index)" class="hover:text-blue-900 font-bold ml-1">×</button>
+                              </span>
+                              <input
+                                v-model="state.tagInput"
+                                @keydown="onTagInputKeydown"
+                                @focus="state.showTagDropdown = true"
+                                @blur="hideTagDropdown"
+                                type="text"
+                                placeholder=""
+                                class="outline-none flex-1 min-w-[80px] text-sm bg-transparent"
+                              />
+                            </div>
+                            <ul
+                              v-if="state.showTagDropdown"
+                              class="absolute z-10 w-full mt-1 max-h-48 overflow-y-auto bg-white border border-slate-200 rounded-xl shadow-lg"
+                            >
+                              <li
+                                v-for="tag in filteredTags"
+                                :key="tag"
+                                @mousedown.prevent="addTag(tag)"
+                                class="px-4 py-2 cursor-pointer hover:bg-slate-50 text-sm"
+                              >{{ tag }}</li>
+                              <li
+                                v-if="state.tagInput && filteredTags.map(t => t.toLowerCase()).indexOf(state.tagInput.toLowerCase()) < 0"
+                                @mousedown.prevent="addTag()"
+                                class="px-4 py-2 cursor-pointer hover:bg-slate-50 text-sm text-blue-600 font-medium"
+                              >创建 "{{ state.tagInput }}"</li>
+                            </ul>
+                          </div>
                         </div>
                         <div>
                           <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">提示词内容</label>

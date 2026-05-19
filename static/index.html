@@ -409,6 +409,7 @@
 
         function restoreVersion() {
           if (!state.viewingHistoryVersion) return;
+          state.editor.title = state.viewingHistoryVersion.title;
           state.editor.content = state.viewingHistoryVersion.content;
           state.showHistoryPanel = false;
           state.viewingHistoryVersion = null;
@@ -946,7 +947,10 @@
                               >v{{ item.version }}</span>
                               <span v-if="item.version === state.currentPrompt?.version" class="text-[10px] text-amber-500 font-medium">当前</span>
                             </div>
-                            <div class="text-xs mt-1.5"
+                            <div class="text-xs mt-1 text-slate-500 truncate"
+                              :class="state.viewingHistoryVersion && state.viewingHistoryVersion.id === item.id ? 'text-slate-300' : 'text-slate-500'"
+                            >{{ item.title }}</div>
+                            <div class="text-xs mt-1"
                               :class="state.viewingHistoryVersion && state.viewingHistoryVersion.id === item.id ? 'text-slate-300' : 'text-slate-400'"
                             >{{ new Date(item.created_at).toLocaleString() }}</div>
                           </button>

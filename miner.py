@@ -255,6 +255,7 @@ class PromptVersionItem(BaseModel):
     id: int
     prompt_id: int
     version: int
+    title: str = ""
     content: str
     variables: list[str] = Field(default_factory=list)
     created_at: str
@@ -523,6 +524,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 prompt_id INTEGER NOT NULL REFERENCES prompts(id),
                 version INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL,
                 variables TEXT,
                 created_at TEXT NOT NULL
@@ -559,7 +561,32 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass
 
+    pv_cols = set(r[1] for r in conn.execute("PRAGMA table_info(prompt_versions)").fetchall())
+    if "title" not in pv_cols:
+        try:
+            conn.execute("ALTER TABLE prompt_versions ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
     conn.execute("UPDATE prompts SET vault_id = ? WHERE vault_id IS NULL", (default_vault_id,))
+
+    # Backfill version 1 snapshots for prompts created before prompt_versions existed
+    missing = conn.execute(
+        """
+        SELECT p.id, p.title, p.content, p.variables, p.version, p.updated_at
+        FROM prompts p
+        WHERE NOT EXISTS (
+            SELECT 1 FROM prompt_versions pv WHERE pv.prompt_id = p.id AND pv.version = 1
+        )
+        """
+    ).fetchall()
+    if missing:
+        with conn:
+            for row in missing:
+                conn.execute(
+                    "INSERT INTO prompt_versions (prompt_id, version, title, content, variables, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+                    (row["id"], row["title"], row["content"], row["variables"], row["updated_at"] or current_timestamp()),
+                )
 
     fts_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='prompts_fts'"
@@ -1082,9 +1109,10 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
     try:
         with conn:
             if prompt_id is None:
-                existing = conn.execute("SELECT id, version FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
+                existing = conn.execute("SELECT id, version, title, content FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
                 if existing:
-                    new_version = (existing["version"] or 1) + 1
+                    changed = existing["content"] != payload.content or existing["title"] != payload.title
+                    new_version = (existing["version"] or 1) + 1 if changed else existing["version"]
                     conn.execute(
                         """
                         UPDATE prompts
@@ -1099,6 +1127,11 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         ),
                     )
                     row = conn.execute("SELECT * FROM prompts WHERE id = ?", (existing["id"],)).fetchone()
+                    if changed:
+                        conn.execute(
+                            "INSERT INTO prompt_versions (prompt_id, version, title, content, variables, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (row["id"], new_version, payload.title, payload.content, variables_json, updated_at),
+                        )
                 else:
                     new_version = 1
                     conn.execute(
@@ -1112,11 +1145,16 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         ),
                     )
                     row = conn.execute("SELECT * FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
+                    conn.execute(
+                        "INSERT INTO prompt_versions (prompt_id, version, title, content, variables, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+                        (row["id"], payload.title, payload.content, variables_json, updated_at),
+                    )
             else:
                 existing = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
                 if existing is None:
                     raise HTTPException(status_code=404, detail="提示词不存在")
-                new_version = (existing["version"] or 1) + 1
+                changed = existing["content"] != payload.content or existing["title"] != payload.title
+                new_version = (existing["version"] or 1) + 1 if changed else existing["version"]
                 effective_vault_id = vault_id if payload.vault_id is not None else (existing["vault_id"] or _get_default_vault_id())
                 conn.execute(
                     """
@@ -1132,13 +1170,11 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                     ),
                 )
                 row = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
-
-            # Insert version snapshot within the same transaction
-            if row is not None:
-                conn.execute(
-                    "INSERT INTO prompt_versions (prompt_id, version, content, variables, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (row["id"], new_version, payload.content, variables_json, updated_at),
-                )
+                if changed:
+                    conn.execute(
+                        "INSERT INTO prompt_versions (prompt_id, version, title, content, variables, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (row["id"], new_version, payload.title, payload.content, variables_json, updated_at),
+                    )
     except sqlite3.IntegrityError as exc:
         conn.close()
         raise HTTPException(status_code=409, detail="标题或 UID 冲突") from exc
@@ -1508,6 +1544,7 @@ async def list_prompt_versions(prompt_id: int) -> list[PromptVersionItem]:
                 id=row["id"],
                 prompt_id=row["prompt_id"],
                 version=row["version"],
+                title=row["title"],
                 content=row["content"],
                 variables=variables_from_json(row["variables"]),
                 created_at=row["created_at"],

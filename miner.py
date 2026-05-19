@@ -125,10 +125,17 @@ class PromptLLMOutput(BaseModel):
     content: str = Field(..., min_length=30)
     tags: list[str] = Field(default_factory=list)
 
-    @field_validator("title", "content")
+    @field_validator("title")
     @classmethod
-    def normalize_text(cls, value: str) -> str:
+    def normalize_title(cls, value: str) -> str:
         return re.sub(r"\s+", " ", value).strip()
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        val = value.replace("\\n", "\n")
+        val = re.sub(r"\n{3,}", "\n\n", val)
+        return val.strip()
 
     @field_validator("tags")
     @classmethod

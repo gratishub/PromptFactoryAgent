@@ -233,6 +233,17 @@
           state.variableValues = {};
         }
 
+        function createNewPrompt() {
+          state.currentPrompt = null;
+          state.editor.title = "";
+          state.editor.content = "";
+          state.editor.tagsText = "";
+          state.editor.category = "";
+          state.variableValues = {};
+          state.drawerOpen = true;
+          state.drawerMode = "edit";
+        }
+
         async function savePrompt() {
           state.saving = true;
           try {
@@ -243,26 +254,34 @@
               category: state.editor.category || "通用",
               vault_id: state.currentVaultId,
             };
-            const isUpdate = !!(state.currentPrompt && state.currentPrompt.id);
-            const response = await apiFetch(
-              isUpdate ? `/api/prompts/${state.currentPrompt.id}` : "/api/prompts",
-              {
-                method: isUpdate ? "PUT" : "POST",
+
+            let response;
+            if (state.currentPrompt && state.currentPrompt.id) {
+              response = await apiFetch(`/api/prompts/${state.currentPrompt.id}`, {
+                method: "PUT",
                 body: JSON.stringify(payload),
-              }
-            );
+              });
+            } else {
+              response = await apiFetch("/api/prompts", {
+                method: "POST",
+                body: JSON.stringify(payload),
+              });
+            }
+
             const body = await response.json().catch(() => ({}));
             if (!response.ok) {
               throw new Error(body.detail || "保存失败");
             }
+
             state.currentPrompt = body;
             state.editor.title = body.title;
             state.editor.content = body.content;
             state.editor.tagsText = tagsToText(body.tags || []);
             state.editor.category = body.category || "";
-            await loadPrompts();
+
             state.drawerMode = "preview";
             showToast("保存成功");
+            await loadPrompts(true);
           } catch (error) {
             if (error.message !== "unauthorized") {
               showToast(error.message || "保存失败", "error");
@@ -581,6 +600,7 @@
           loadPrompts,
           openPrompt,
           newPrompt,
+          createNewPrompt,
           savePrompt,
           deletePrompt,
           copyPrompt,
@@ -712,6 +732,12 @@
                     @click="minePrompt"
                   >
                     {{ state.mining ? '挖掘中...' : '发起挖掘' }}
+                  </button>
+                  <button
+                    class="whitespace-nowrap rounded-2xl bg-slate-900 px-3 py-2 md:px-4 md:py-3 text-sm font-medium text-white hover:bg-slate-800"
+                    @click="createNewPrompt"
+                  >
+                    ➕ 新建提示词
                   </button>
                   <button
                     class="whitespace-nowrap rounded-2xl bg-slate-900 px-3 py-2 md:px-4 md:py-3 text-sm font-medium text-white hover:bg-slate-800"

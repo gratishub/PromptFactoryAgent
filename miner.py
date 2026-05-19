@@ -74,6 +74,7 @@ class CrawlerConfig(BaseModel):
 
 class StorageConfig(BaseModel):
     vault_path: str
+    max_vaults: int = Field(default=5)
     allowed_export_paths: list[str] = Field(default_factory=list)
 
 
@@ -315,8 +316,8 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def vault_dir() -> Path:
-    path = Path(CONFIG.storage.vault_path)
+def vault_dir(slug: str = "default") -> Path:
+    path = Path(CONFIG.storage.vault_path) / slug
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -353,9 +354,9 @@ def current_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def markdown_file_path(uid: str, title: str) -> Path:
+def markdown_file_path(uid: str, title: str, vault_slug: str = "default") -> Path:
     filename = f"{sanitize_slug(uid or title)}.md"
-    return vault_dir() / filename
+    return vault_dir(vault_slug) / filename
 
 
 def ensure_vault_path(path: Path) -> Path:
@@ -440,6 +441,16 @@ def init_db() -> None:
     with conn:
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS vaults (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                slug TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS prompts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uid TEXT NOT NULL UNIQUE,
@@ -450,12 +461,30 @@ def init_db() -> None:
                 raw_markdown TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 version INTEGER DEFAULT 1,
-                variables TEXT
+                variables TEXT,
+                vault_id INTEGER NOT NULL DEFAULT 1 REFERENCES vaults(id)
             )
             """
         )
 
+    vault_count = conn.execute("SELECT COUNT(*) FROM vaults").fetchone()[0]
+    if vault_count == 0:
+        with conn:
+            conn.execute(
+                "INSERT INTO vaults (name, slug, created_at) VALUES (?, ?, ?)",
+                ("默认知识库", "default", current_timestamp()),
+            )
+
+    default_vault = conn.execute("SELECT id FROM vaults WHERE slug = 'default'").fetchone()
+    default_vault_id = default_vault["id"] if default_vault else 1
+
     existing_cols = set(r[1] for r in conn.execute("PRAGMA table_info(prompts)").fetchall())
+    if "vault_id" not in existing_cols:
+        try:
+            conn.execute("ALTER TABLE prompts ADD COLUMN vault_id INTEGER REFERENCES vaults(id)")
+            conn.execute("UPDATE prompts SET vault_id = ?", (default_vault_id,))
+        except sqlite3.OperationalError:
+            pass
     if "version" not in existing_cols:
         try:
             conn.execute("ALTER TABLE prompts ADD COLUMN version INTEGER DEFAULT 1")
@@ -943,8 +972,8 @@ def all_available_tags(conn: sqlite3.Connection) -> list[str]:
     return sorted(tag_set)
 
 
-async def export_prompt_to_markdown(uid: str, title: str, content: str, tags: list[str], category: str, updated_at: str, version: int = 1, variables: list[str] | None = None) -> None:
-    file_path = ensure_vault_path(markdown_file_path(uid, title))
+async def export_prompt_to_markdown(uid: str, title: str, content: str, tags: list[str], category: str, updated_at: str, version: int = 1, variables: list[str] | None = None, vault_slug: str = "default") -> None:
+    file_path = ensure_vault_path(markdown_file_path(uid, title, vault_slug))
     raw_markdown = render_markdown_document(title, content, tags, category, updated_at, version, variables)
     async with aiofiles.open(file_path, "w", encoding="utf-8") as handle:
         await handle.write(raw_markdown)
@@ -974,6 +1003,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
         existing_version,
         variables if variables else None,
     )
+    vault_id = _get_default_vault_id()
 
     conn = get_conn()
     try:
@@ -981,8 +1011,8 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
             if prompt_id is None:
                 conn.execute(
                     """
-                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables, vault_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(uid) DO UPDATE SET
                       title = excluded.title,
                       content = excluded.content,
@@ -991,7 +1021,8 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                       raw_markdown = excluded.raw_markdown,
                       updated_at = excluded.updated_at,
                       version = excluded.version,
-                      variables = excluded.variables
+                      variables = excluded.variables,
+                      vault_id = excluded.vault_id
                     """,
                     (
                         prompt_uid,
@@ -1003,6 +1034,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         updated_at,
                         existing_version,
                         variables_to_json(variables) if variables else None,
+                        vault_id,
                     ),
                 )
                 row = conn.execute("SELECT * FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
@@ -1013,7 +1045,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                 conn.execute(
                     """
                     UPDATE prompts
-                    SET uid = ?, title = ?, content = ?, tags = ?, category = ?, raw_markdown = ?, updated_at = ?, version = ?, variables = ?
+                    SET uid = ?, title = ?, content = ?, tags = ?, category = ?, raw_markdown = ?, updated_at = ?, version = ?, variables = ?, vault_id = ?
                     WHERE id = ?
                     """,
                     (
@@ -1026,6 +1058,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         updated_at,
                         existing_version,
                         variables_to_json(variables) if variables else None,
+                        vault_id,
                         prompt_id,
                     ),
                 )
@@ -1081,52 +1114,91 @@ def import_vault_to_db() -> None:
     init_db()
     conn = get_conn()
     try:
-        for path in vault_dir().glob("*.md"):
-            parsed = parse_markdown_document(path)
-            existing = conn.execute("SELECT * FROM prompts WHERE uid = ?", (parsed["uid"],)).fetchone()
-            file_mtime = parsed["mtime"]
-            if existing and existing["updated_at"] >= file_mtime:
-                continue
-            tags = parsed["tags"] or []
-            category = parsed["category"] or infer_category_from_tags(tags)
-            content = parsed["content"]
-            raw_markdown = parsed["raw_markdown"]
-            version = parsed.get("version", 1)
-            variables = parsed.get("variables", [])
-            with conn:
-                conn.execute(
-                    """
-                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid) DO UPDATE SET
-                      title = excluded.title,
-                      content = excluded.content,
-                      tags = excluded.tags,
-                      category = excluded.category,
-                      raw_markdown = excluded.raw_markdown,
-                      updated_at = excluded.updated_at,
-                      version = excluded.version,
-                      variables = excluded.variables
-                    """,
-                    (
-                        parsed["uid"],
-                        parsed["title"],
-                        content,
-                        tags_to_json(tags),
-                        category,
-                        raw_markdown,
-                        file_mtime,
-                        version,
-                        variables_to_json(variables) if variables else None,
-                    ),
-                )
+        vaults = conn.execute("SELECT id, slug FROM vaults").fetchall()
+        for vault in vaults:
+            vault_id = vault["id"]
+            vault_slug = vault["slug"]
+            for path in vault_dir(vault_slug).glob("*.md"):
+                parsed = parse_markdown_document(path)
+                existing = conn.execute("SELECT * FROM prompts WHERE uid = ?", (parsed["uid"],)).fetchone()
+                file_mtime = parsed["mtime"]
+                if existing and existing["updated_at"] >= file_mtime:
+                    continue
+                tags = parsed["tags"] or []
+                category = parsed["category"] or infer_category_from_tags(tags)
+                content = parsed["content"]
+                raw_markdown = parsed["raw_markdown"]
+                version = parsed.get("version", 1)
+                variables = parsed.get("variables", [])
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables, vault_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(uid) DO UPDATE SET
+                          title = excluded.title,
+                          content = excluded.content,
+                          tags = excluded.tags,
+                          category = excluded.category,
+                          raw_markdown = excluded.raw_markdown,
+                          updated_at = excluded.updated_at,
+                          version = excluded.version,
+                          variables = excluded.variables,
+                          vault_id = excluded.vault_id
+                        """,
+                        (
+                            parsed["uid"],
+                            parsed["title"],
+                            content,
+                            tags_to_json(tags),
+                            category,
+                            raw_markdown,
+                            file_mtime,
+                            version,
+                            variables_to_json(variables) if variables else None,
+                            vault_id,
+                        ),
+                    )
     finally:
         conn.close()
+
+
+_DEFAULT_VAULT_ID: int | None = None
+
+
+def _get_default_vault_id() -> int:
+    global _DEFAULT_VAULT_ID
+    if _DEFAULT_VAULT_ID is not None:
+        return _DEFAULT_VAULT_ID
+    conn = get_conn()
+    row = conn.execute("SELECT id FROM vaults WHERE slug = 'default'").fetchone()
+    conn.close()
+    if row is None:
+        raise RuntimeError("默认知识库不存在")
+    _DEFAULT_VAULT_ID = row["id"]
+    return _DEFAULT_VAULT_ID
+
+
+def migrate_filesystem_to_multi_vault() -> None:
+    base = Path(CONFIG.storage.vault_path)
+    if not base.exists():
+        return
+    md_files = list(base.glob("*.md"))
+    if not md_files:
+        return
+    default_dir = base / "default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    for md_file in md_files:
+        target = default_dir / md_file.name
+        if not target.exists():
+            md_file.rename(target)
+            LOGGER.info("迁移历史文件: %s -> %s", md_file, target)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    migrate_filesystem_to_multi_vault()
     vault_dir()
     import_vault_to_db()
     yield

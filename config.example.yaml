@@ -20,6 +20,7 @@ crawler:
 
 storage:
   vault_path: "./vault"
+  max_vaults: 5
   allowed_export_paths:
     - "./vault"
 

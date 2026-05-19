@@ -57,6 +57,7 @@
           currentVaultId: null,
           showVaultManager: false,
           tagsCollapsed: false,
+          tagSearch: "",
           newVaultName: "",
           newVaultSlug: "",
           vaultManagerError: null,
@@ -64,7 +65,10 @@
           viewingHistoryVersion: null,
           showHistoryPanel: false,
           showTagDropdown: false,
+          zenMode: false,
         });
+
+        const expandedGroups = reactive({ "分类": true, "模型": true, "主题": true, "其他": true });
 
         const filteredPromptCount = computed(() => state.prompts.length);
 
@@ -77,6 +81,21 @@
           return available.filter(tag =>
             tag.toLowerCase().includes(input.toLowerCase()) && !current.includes(tag.toLowerCase())
           );
+        });
+
+        const groupedTags = computed(() => {
+          const search = (state.tagSearch || "").toLowerCase();
+          const tags = state.availableTags || [];
+          const filtered = search ? tags.filter(t => t.toLowerCase().includes(search)) : tags;
+          const groups = { "分类": [], "模型": [], "主题": [], "其他": [] };
+          filtered.forEach(tag => {
+            const slashIdx = tag.indexOf("/");
+            const groupName = slashIdx > 0 ? tag.slice(0, slashIdx) : "其他";
+            const name = slashIdx > 0 ? tag.slice(slashIdx + 1) : tag;
+            if (!groups[groupName]) groups[groupName] = [];
+            groups[groupName].push({ raw: tag, name });
+          });
+          return groups;
         });
 
         const interpolatedContent = computed(() => {
@@ -392,9 +411,7 @@
             if (!state.editor.title && body.title) {
               state.editor.title = body.title;
             }
-            if (!state.editor.tagsText && body.tags && body.tags.length > 0) {
-              state.editor.tagsText = body.tags.join(", ");
-            }
+            if (body.tags && body.tags.length > 0) { state.editor.tags = body.tags; }
             showToast("优化成功");
           } catch (error) {
             if (error.message !== "unauthorized") {
@@ -529,6 +546,7 @@
 
         function closeDrawer() {
           state.drawerOpen = false;
+          state.zenMode = false;
         }
 
         function debouncedSearch() {
@@ -547,6 +565,23 @@
           loadPrompts();
         }
 
+        function highlightText(text, search) {
+          if (!search) return text;
+          const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const regex = new RegExp(`(${escaped})`, "gi");
+          return text.replace(regex, '<mark class="bg-amber-200/80 text-amber-950 px-0.5 rounded font-medium">$1</mark>');
+        }
+
+        function getCategoryStyle(category) {
+          const map = {
+            "编程": "bg-blue-50 text-blue-700 border-blue-100",
+            "营销": "bg-orange-50 text-orange-700 border-orange-100",
+            "智能体": "bg-purple-50 text-purple-700 border-purple-100",
+            "研究": "bg-emerald-50 text-emerald-700 border-emerald-100",
+          };
+          return map[category] || "bg-slate-50 text-slate-600 border-slate-200";
+        }
+
         function toggleTag(tag) {
           state.selectedTag = state.selectedTag === tag ? "" : tag;
           loadPrompts();
@@ -555,7 +590,7 @@
         function addTag(tagValue = null) {
           const tag = tagValue !== null ? tagValue : state.tagInput.trim();
           if (tag && !(state.editor.tags || []).map(t => t.toLowerCase()).includes(tag.toLowerCase())) {
-            if (!state.editor.tags) state.editor.tags = [];
+            if (!Array.isArray(state.editor.tags)) { state.editor.tags = []; }
             state.editor.tags.push(tag);
           }
           state.tagInput = "";
@@ -574,6 +609,7 @@
         }
 
         function onTagInputKeydown(e) {
+          if (e.isComposing) return;
           if (e.key === "Enter") {
             e.preventDefault();
             addTag();
@@ -658,6 +694,16 @@
           debouncedSearch,
           onSearchEnter,
           toggleTag,
+          filteredTags,
+          groupedTags,
+          expandedGroups,
+          addTag,
+          removeTag,
+          handleTagDelete,
+          onTagInputKeydown,
+          hideTagDropdown,
+          highlightText,
+          getCategoryStyle,
           minePrompt,
           restoreSession,
           optimizePromptContent,
@@ -765,8 +811,9 @@
                     @keyup.enter="onSearchEnter"
                     type="text"
                     placeholder="搜索标题或内容..."
-                    class="w-full rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-12 pr-4 text-base outline-none transition focus:border-slate-900"
+                    class="w-full rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-12 pr-10 text-base outline-none transition focus:border-slate-900"
                   />
+                  <button v-if="state.search" @click="state.search = ''; loadPrompts();" class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-sm font-bold">×</button>
                 </div>
 
                 <div class="flex items-center gap-2 md:gap-3">
@@ -784,13 +831,13 @@
                     {{ state.mining ? '挖掘中...' : '发起挖掘' }}
                   </button>
                   <button
-                    class="whitespace-nowrap rounded-2xl bg-slate-900 px-3 py-2 md:px-4 md:py-3 text-sm font-medium text-white hover:bg-slate-800"
+                    class="whitespace-nowrap rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2 md:px-4 md:py-3 text-sm font-medium text-white shadow-md shadow-indigo-100 hover:from-indigo-700 hover:to-violet-700"
                     @click="createNewPrompt"
                   >
                     ➕ 新建提示词
                   </button>
                   <button
-                    class="whitespace-nowrap rounded-2xl bg-slate-900 px-3 py-2 md:px-4 md:py-3 text-sm font-medium text-white hover:bg-slate-800"
+                    class="whitespace-nowrap rounded-2xl border border-transparent bg-transparent px-3 py-2 md:px-4 md:py-3 text-sm font-medium text-slate-400 hover:border-slate-200 hover:text-slate-600"
                     @click="logout"
                   >
                     退出登录
@@ -822,27 +869,31 @@
                       </button>
                     </div>
                   </div>
-                  <div v-if="!state.tagsCollapsed" class="mt-5 flex flex-wrap gap-2">
-                    <button
-                      class="rounded-full border px-3 py-2 text-xs font-medium transition"
-                      :class="state.selectedTag === ''
-                        ? 'border-slate-900 bg-slate-900 text-white'
-                        : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-900 hover:text-slate-900'"
-                      @click="toggleTag('')"
-                    >
-                      全部
-                    </button>
-                    <button
-                      v-for="tag in state.availableTags"
-                      :key="tag"
-                      class="rounded-full border px-3 py-2 text-xs font-medium transition"
-                      :class="state.selectedTag === tag
-                        ? 'border-slate-900 bg-slate-900 text-white'
-                        : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-900 hover:text-slate-900'"
-                      @click="toggleTag(tag)"
-                    >
-                      {{ tag }}
-                    </button>
+                  <input v-model="state.tagSearch" type="text" placeholder="过滤标签..." class="w-full mb-4 rounded-xl border border-slate-100 bg-slate-50 px-3 py-1.5 text-xs outline-none focus:border-slate-300" />
+                  <div v-if="!state.tagsCollapsed" class="space-y-3">
+                    <div v-for="(tags, groupName) in groupedTags" :key="groupName">
+                      <button
+                        v-if="tags.length > 0"
+                        @click="expandedGroups[groupName] = !expandedGroups[groupName]"
+                        class="flex items-center gap-1.5 mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition"
+                      >
+                        <svg class="h-2.5 w-2.5 transition-transform" :class="expandedGroups[groupName] ? 'rotate-90' : ''" viewBox="0 0 24 24" fill="currentColor"><path d="M9 18l6-6-6-6"/></svg>
+                        {{ groupName }} <span class="font-normal opacity-60">({{ tags.length }})</span>
+                      </button>
+                      <div v-show="expandedGroups[groupName]" class="flex flex-wrap gap-1.5">
+                        <button
+                          v-for="tag in tags"
+                          :key="tag.raw"
+                          class="rounded-full border px-2.5 py-1 text-[11px] font-medium transition"
+                          :class="state.selectedTag === tag.raw
+                            ? 'border-slate-900 bg-slate-900 text-white'
+                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:border-slate-900 hover:text-slate-900'"
+                          @click="toggleTag(tag.raw)"
+                        >
+                          {{ tag.name }}
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </section>
               </aside>
@@ -874,11 +925,11 @@
                     v-for="item in state.prompts"
                     :key="item.id"
                     @click="openPrompt(item.id)"
-                    class="group cursor-pointer rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm transition duration-200 hover:-translate-y-1 hover:shadow-xl hover:shadow-slate-200/70"
+                    class="group relative cursor-pointer rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm transition duration-200 hover:-translate-y-1 hover:shadow-xl hover:shadow-slate-200/70 overflow-hidden"
                   >
                     <div class="flex items-start justify-between gap-3">
-                      <h3 class="line-clamp-2 text-lg font-semibold text-slate-900">{{ item.title }}</h3>
-                      <span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 flex-shrink-0">
+                      <h3 class="line-clamp-2 font-bold text-slate-900 tracking-tight text-lg sm:text-xl" v-html="highlightText(item.title, state.search)"></h3>
+                      <span :class="getCategoryStyle(item.category)" class="border px-2 py-0.5 text-[10px] font-bold flex-shrink-0 uppercase tracking-wider rounded">
                         {{ item.category }}
                       </span>
                     </div>
@@ -891,12 +942,13 @@
                         {{ tag }}
                       </span>
                     </div>
-                    <p class="mt-4 text-sm leading-7 text-slate-600 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                      {{ item.excerpt }}
-                    </p>
+                    <p class="mt-4 text-sm leading-7 text-slate-600 whitespace-pre-wrap break-words [overflow-wrap:anywhere]" v-html="highlightText(item.excerpt, state.search)"></p>
                     <div class="mt-5 text-xs text-slate-400">
                       最近更新：{{ new Date(item.updated_at).toLocaleString() }}
                     </div>
+                    <button @click.stop="state.editor.content = item.content; copyPrompt();" class="absolute bottom-4 right-4 p-2 rounded-xl bg-white border border-slate-200 text-slate-500 shadow-sm opacity-0 group-hover:opacity-100 hover:text-slate-900 hover:border-slate-400 transition-all duration-200 z-10" title="一键快速复制">
+                      <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
                   </article>
                 </div>
               </main>
@@ -904,7 +956,7 @@
 
             <transition name="slide">
               <div v-if="state.drawerOpen" class="fixed inset-0 z-40 flex justify-end bg-slate-950/30 backdrop-blur-[2px]">
-                <div class="flex h-full w-full max-w-4xl flex-col bg-white shadow-2xl shadow-slate-300/60 overflow-hidden"
+                <div class="flex h-full w-full flex-col bg-white shadow-2xl shadow-slate-300/60 overflow-hidden" :class="state.zenMode ? 'max-w-full' : 'max-w-4xl'"
                      style="padding-bottom:env(safe-area-inset-bottom);">
                   <div class="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-6 sm:py-5">
                     <div>
@@ -941,6 +993,13 @@
 
                     <div class="flex flex-wrap items-center gap-2 sm:gap-3 w-full sm:w-auto">
                       <button
+                        class="rounded-xl sm:rounded-2xl border border-slate-200 text-slate-400 hover:text-rose-600 hover:border-rose-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium"
+                        :disabled="state.deleting"
+                        @click="deletePrompt"
+                      >
+                        {{ state.deleting ? '删除中...' : '删除' }}
+                      </button>
+                      <button
                         class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
                         @click="state.showHistoryPanel = !state.showHistoryPanel; state.viewingHistoryVersion = null;"
                       >
@@ -953,11 +1012,10 @@
                         复制
                       </button>
                       <button
-                        class="rounded-xl sm:rounded-2xl border border-rose-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-60"
-                        :disabled="state.deleting"
-                        @click="deletePrompt"
+                        @click="state.zenMode = !state.zenMode"
+                        class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
                       >
-                        {{ state.deleting ? '删除中...' : '删除' }}
+                        {{ state.zenMode ? '退出全屏' : '🧘 全屏编辑' }}
                       </button>
                       <button
                         class="rounded-xl sm:rounded-2xl bg-slate-900 px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
@@ -1097,7 +1155,8 @@
                           <div class="relative">
                             <textarea
                               v-model="state.editor.content"
-                              class="min-h-[300px] md:min-h-[420px] w-full rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 font-mono text-base leading-6 sm:leading-7 text-slate-800 outline-none transition focus:border-slate-900 focus:ring-0 focus:outline-none appearance-none resize-none"
+                              class="w-full rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 font-mono text-base leading-6 sm:leading-7 text-slate-800 outline-none transition focus:border-slate-900 focus:ring-0 focus:outline-none appearance-none resize-none"
+                              :class="state.zenMode ? 'min-h-[calc(100vh-220px)]' : 'min-h-[300px] md:min-h-[420px]'"
                               style="overflow-wrap:normal;white-space:pre-wrap;word-break:break-word;-webkit-appearance:none;appearance:none;"
                             ></textarea>
                             <button

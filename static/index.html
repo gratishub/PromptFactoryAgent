@@ -56,6 +56,7 @@
           vaults: [],
           currentVaultId: null,
           showVaultManager: false,
+          tagsCollapsed: false,
           newVaultName: "",
           newVaultSlug: "",
           vaultManagerError: null,
@@ -758,14 +759,22 @@
                       <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Filters</p>
                       <h2 class="mt-2 text-lg font-semibold text-slate-900">标签 / 分类云</h2>
                     </div>
-                    <button
-                      class="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900"
-                      @click="newPrompt"
-                    >
-                      新建
-                    </button>
+                    <div class="flex items-center gap-2">
+                      <button
+                        class="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900"
+                        @click="newPrompt"
+                      >
+                        新建
+                      </button>
+                      <button
+                        class="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900"
+                        @click="state.tagsCollapsed = !state.tagsCollapsed"
+                      >
+                        {{ state.tagsCollapsed ? '展开' : '收起' }}
+                      </button>
+                    </div>
                   </div>
-                  <div class="mt-5 flex flex-wrap gap-2">
+                  <div v-if="!state.tagsCollapsed" class="mt-5 flex flex-wrap gap-2">
                     <button
                       class="rounded-full border px-3 py-2 text-xs font-medium transition"
                       :class="state.selectedTag === ''
@@ -884,8 +893,7 @@
 
                     <div class="flex flex-wrap items-center gap-2 sm:gap-3 w-full sm:w-auto">
                       <button
-                        class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900 disabled:opacity-40"
-                        :disabled="!state.currentPrompt"
+                        class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
                         @click="state.showHistoryPanel = !state.showHistoryPanel; state.viewingHistoryVersion = null;"
                       >
                         🕒 历史版本

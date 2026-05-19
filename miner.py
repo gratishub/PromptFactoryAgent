@@ -251,6 +251,24 @@ class PromptDetail(BaseModel):
     vault_id: int
 
 
+class PromptVersionItem(BaseModel):
+    id: int
+    prompt_id: int
+    version: int
+    content: str
+    variables: list[str] = Field(default_factory=list)
+    created_at: str
+
+    @field_validator("variables", mode="before")
+    @classmethod
+    def parse_variables(cls, value: object) -> list[str]:
+        if isinstance(value, str):
+            return variables_from_json(value)
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return []
+
+
 class MinePromptResponse(BaseModel):
     keyword: str
     prompt: PromptDetail
@@ -496,6 +514,18 @@ def init_db() -> None:
                 version INTEGER DEFAULT 1,
                 variables TEXT,
                 vault_id INTEGER NOT NULL DEFAULT 1 REFERENCES vaults(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompt_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt_id INTEGER NOT NULL REFERENCES prompts(id),
+                version INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                variables TEXT,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -1026,20 +1056,24 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
         tags = sorted(set(tags + [f"#分类/{category}"]))
     updated_at = current_timestamp()
     variables = extract_jinja_variables(payload.content)
-    existing_version = 1
+    variables_json = variables_to_json(variables) if variables else None
+
+    # Determine version for raw_markdown preview (best-effort; final version set inside transaction)
+    preview_version = 1
     if prompt_id is not None:
         conn_check = get_conn()
-        existing_row = conn_check.execute("SELECT version, variables FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
+        existing_row = conn_check.execute("SELECT version FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
         conn_check.close()
         if existing_row:
-            existing_version = existing_row["version"] or 1
+            preview_version = (existing_row["version"] or 1) + 1
+
     raw_markdown = payload.raw_markdown or render_markdown_document(
         payload.title,
         payload.content,
         tags,
         category,
         updated_at,
-        existing_version,
+        preview_version,
         variables if variables else None,
     )
     vault_id = payload.vault_id if payload.vault_id is not None else _get_default_vault_id()
@@ -1048,62 +1082,63 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
     try:
         with conn:
             if prompt_id is None:
-                conn.execute(
-                    """
-                    INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables, vault_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid) DO UPDATE SET
-                      title = excluded.title,
-                      content = excluded.content,
-                      tags = excluded.tags,
-                      category = excluded.category,
-                      raw_markdown = excluded.raw_markdown,
-                      updated_at = excluded.updated_at,
-                      version = excluded.version,
-                      variables = excluded.variables,
-                      vault_id = excluded.vault_id
-                    """,
-                    (
-                        prompt_uid,
-                        payload.title,
-                        payload.content,
-                        tags_to_json(tags),
-                        category,
-                        raw_markdown,
-                        updated_at,
-                        existing_version,
-                        variables_to_json(variables) if variables else None,
-                        vault_id,
-                    ),
-                )
-                row = conn.execute("SELECT * FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
+                existing = conn.execute("SELECT id, version FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
+                if existing:
+                    new_version = (existing["version"] or 1) + 1
+                    conn.execute(
+                        """
+                        UPDATE prompts
+                        SET title = ?, content = ?, tags = ?, category = ?, raw_markdown = ?,
+                            updated_at = ?, version = ?, variables = ?, vault_id = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            payload.title, payload.content, tags_to_json(tags), category,
+                            raw_markdown, updated_at, new_version, variables_json,
+                            vault_id, existing["id"],
+                        ),
+                    )
+                    row = conn.execute("SELECT * FROM prompts WHERE id = ?", (existing["id"],)).fetchone()
+                else:
+                    new_version = 1
+                    conn.execute(
+                        """
+                        INSERT INTO prompts (uid, title, content, tags, category, raw_markdown, updated_at, version, variables, vault_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            prompt_uid, payload.title, payload.content, tags_to_json(tags),
+                            category, raw_markdown, updated_at, new_version, variables_json, vault_id,
+                        ),
+                    )
+                    row = conn.execute("SELECT * FROM prompts WHERE uid = ?", (prompt_uid,)).fetchone()
             else:
                 existing = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
                 if existing is None:
                     raise HTTPException(status_code=404, detail="提示词不存在")
-                # Preserve existing vault_id if payload doesn't specify one
+                new_version = (existing["version"] or 1) + 1
                 effective_vault_id = vault_id if payload.vault_id is not None else (existing["vault_id"] or _get_default_vault_id())
                 conn.execute(
                     """
                     UPDATE prompts
-                    SET uid = ?, title = ?, content = ?, tags = ?, category = ?, raw_markdown = ?, updated_at = ?, version = ?, variables = ?, vault_id = ?
+                    SET uid = ?, title = ?, content = ?, tags = ?, category = ?,
+                        raw_markdown = ?, updated_at = ?, version = ?, variables = ?, vault_id = ?
                     WHERE id = ?
                     """,
                     (
-                        prompt_uid,
-                        payload.title,
-                        payload.content,
-                        tags_to_json(tags),
-                        category,
-                        raw_markdown,
-                        updated_at,
-                        existing_version,
-                        variables_to_json(variables) if variables else None,
-                        effective_vault_id,
-                        prompt_id,
+                        prompt_uid, payload.title, payload.content, tags_to_json(tags),
+                        category, raw_markdown, updated_at, new_version, variables_json,
+                        effective_vault_id, prompt_id,
                     ),
                 )
                 row = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
+
+            # Insert version snapshot within the same transaction
+            if row is not None:
+                conn.execute(
+                    "INSERT INTO prompt_versions (prompt_id, version, content, variables, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (row["id"], new_version, payload.content, variables_json, updated_at),
+                )
     except sqlite3.IntegrityError as exc:
         conn.close()
         raise HTTPException(status_code=409, detail="标题或 UID 冲突") from exc
@@ -1455,6 +1490,32 @@ async def get_prompt(prompt_id: int) -> PromptDetail:
     if row is None:
         raise HTTPException(status_code=404, detail="提示词不存在")
     return row_to_detail(row)
+
+
+@app.get("/api/prompts/{prompt_id}/versions", dependencies=[Depends(verify_token)])
+async def list_prompt_versions(prompt_id: int) -> list[PromptVersionItem]:
+    conn = get_conn()
+    try:
+        prompt_row = conn.execute("SELECT id FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
+        if prompt_row is None:
+            raise HTTPException(status_code=404, detail="提示词不存在")
+        rows = conn.execute(
+            "SELECT * FROM prompt_versions WHERE prompt_id = ? ORDER BY version DESC",
+            (prompt_id,),
+        ).fetchall()
+        return [
+            PromptVersionItem(
+                id=row["id"],
+                prompt_id=row["prompt_id"],
+                version=row["version"],
+                content=row["content"],
+                variables=variables_from_json(row["variables"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+    finally:
+        conn.close()
 
 
 @app.post("/api/prompts", response_model=PromptDetail, dependencies=[Depends(verify_token)])

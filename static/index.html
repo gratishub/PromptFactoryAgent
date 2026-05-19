@@ -59,6 +59,9 @@
           newVaultName: "",
           newVaultSlug: "",
           vaultManagerError: null,
+          versionHistory: [],
+          viewingHistoryVersion: null,
+          showHistoryPanel: false,
         });
 
         const filteredPromptCount = computed(() => state.prompts.length);
@@ -207,6 +210,9 @@
               payload.variables.forEach(v => { state.variableValues[v] = ""; });
             }
             state.drawerOpen = true;
+            state.showHistoryPanel = false;
+            state.viewingHistoryVersion = null;
+            await fetchVersionHistory(id);
             await nextTick();
             document.querySelectorAll("pre code").forEach((block) => hljs.highlightElement(block));
           } catch (error) {
@@ -363,6 +369,32 @@
           } finally {
             state.optimizing = false;
           }
+        }
+
+        async function fetchVersionHistory(promptId) {
+          try {
+            const response = await apiFetch(`/api/prompts/${promptId}/versions`);
+            const payload = await response.json().catch(() => []);
+            if (!response.ok) throw new Error(payload.detail || "加载历史版本失败");
+            state.versionHistory = payload || [];
+          } catch (error) {
+            if (error.message !== "unauthorized") {
+              showToast(error.message || "加载历史版本失败", "error");
+            }
+          }
+        }
+
+        function viewHistoryContent(item) {
+          state.viewingHistoryVersion = item;
+        }
+
+        function restoreVersion() {
+          if (!state.viewingHistoryVersion) return;
+          state.editor.content = state.viewingHistoryVersion.content;
+          state.showHistoryPanel = false;
+          state.viewingHistoryVersion = null;
+          state.drawerMode = "edit";
+          showToast("已载入历史内容，点击保存即可生成新版本");
         }
 
         function logout() {
@@ -559,6 +591,9 @@
           minePrompt,
           restoreSession,
           optimizePromptContent,
+          fetchVersionHistory,
+          viewHistoryContent,
+          restoreVersion,
           loadVaults,
           createVault,
           deleteVault,
@@ -822,6 +857,13 @@
 
                     <div class="flex flex-wrap items-center gap-2 sm:gap-3 w-full sm:w-auto">
                       <button
+                        class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900 disabled:opacity-40"
+                        :disabled="!state.currentPrompt"
+                        @click="state.showHistoryPanel = !state.showHistoryPanel; state.viewingHistoryVersion = null;"
+                      >
+                        🕒 历史版本
+                      </button>
+                      <button
                         class="rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900"
                         @click="copyPrompt"
                       >
@@ -845,93 +887,154 @@
                   </div>
 
                   <div class="flex-1 overflow-y-auto overflow-x-hidden px-4 py-4 sm:px-6 sm:py-6">
-                    <div v-if="state.drawerMode === 'edit'" class="space-y-5">
-                      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-                        <div>
-                          <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">标题</label>
-                          <input
-                            v-model="state.editor.title"
-                            type="text"
-                            class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
-                          />
-                        </div>
-                        <div>
-                          <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">分类</label>
-                          <input
-                            v-model="state.editor.category"
-                            type="text"
-                            class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
-                          />
-                        </div>
+                    <!-- History Panel -->
+                    <div v-if="state.showHistoryPanel" class="flex flex-col h-full">
+                      <div class="flex items-center justify-between mb-4">
+                        <button
+                          class="rounded-xl border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900 transition"
+                          @click="state.showHistoryPanel = false; state.viewingHistoryVersion = null;"
+                        >
+                          ← 返回编辑
+                        </button>
+                        <span class="text-sm text-slate-400">共 {{ state.versionHistory.length }} 个历史版本</span>
                       </div>
-                      <div>
-                        <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">标签</label>
-                        <input
-                          v-model="state.editor.tagsText"
-                          type="text"
-                          placeholder="#分类/通用, #主题/Agent"
-                          class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
-                        />
-                      </div>
-                      <div>
-                        <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">提示词内容</label>
-                        <div class="relative">
-                          <textarea
-                            v-model="state.editor.content"
-                            class="min-h-[300px] md:min-h-[420px] w-full rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 font-mono text-base leading-6 sm:leading-7 text-slate-800 outline-none transition focus:border-slate-900 focus:ring-0 focus:outline-none appearance-none resize-none"
-                            style="overflow-wrap:normal;white-space:pre-wrap;word-break:break-word;-webkit-appearance:none;appearance:none;"
-                          ></textarea>
+                      <div class="flex flex-col lg:flex-row gap-4 flex-1 min-h-0">
+                        <div class="lg:w-56 flex-shrink-0 space-y-2 overflow-y-auto">
+                          <div v-if="state.versionHistory.length === 0" class="text-sm text-slate-400 text-center py-12">
+                            暂无历史版本
+                          </div>
                           <button
-                            class="absolute bottom-3 right-3 sm:bottom-4 sm:right-4 rounded-xl sm:rounded-2xl bg-gradient-to-r from-violet-600 to-purple-600 px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-white shadow-lg shadow-violet-200 hover:from-violet-700 hover:to-purple-700 disabled:opacity-60"
-                            :disabled="state.optimizing"
-                            @click="optimizePromptContent"
+                            v-for="item in state.versionHistory"
+                            :key="item.id"
+                            @click="viewHistoryContent(item)"
+                            class="w-full text-left rounded-2xl border px-4 py-3 transition"
+                            :class="state.viewingHistoryVersion && state.viewingHistoryVersion.id === item.id
+                              ? 'border-slate-900 bg-slate-900 text-white'
+                              : 'border-slate-200 bg-white hover:border-slate-400 hover:shadow-sm'"
                           >
-                            {{ state.optimizing ? '优化中...' : '✨ AI 优化' }}
+                            <div class="flex items-center gap-2">
+                              <span class="rounded-lg px-2 py-0.5 text-xs font-bold"
+                                :class="state.viewingHistoryVersion && state.viewingHistoryVersion.id === item.id
+                                  ? 'bg-white/20 text-white'
+                                  : 'bg-slate-100 text-slate-700'"
+                              >v{{ item.version }}</span>
+                              <span v-if="item.version === state.currentPrompt?.version" class="text-[10px] text-amber-500 font-medium">当前</span>
+                            </div>
+                            <div class="text-xs mt-1.5"
+                              :class="state.viewingHistoryVersion && state.viewingHistoryVersion.id === item.id ? 'text-slate-300' : 'text-slate-400'"
+                            >{{ new Date(item.created_at).toLocaleString() }}</div>
                           </button>
+                        </div>
+                        <div class="flex-1 min-h-0 overflow-y-auto">
+                          <div v-if="state.viewingHistoryVersion" class="space-y-4">
+                            <div class="rounded-2xl border border-slate-200 bg-slate-50 p-5">
+                              <pre class="text-sm leading-6 text-slate-700 whitespace-pre-wrap font-mono">{{ state.viewingHistoryVersion.content }}</pre>
+                            </div>
+                            <button
+                              @click="restoreVersion"
+                              class="w-full rounded-2xl bg-amber-500 px-4 py-3 text-sm font-semibold text-white hover:bg-amber-600 shadow-lg shadow-amber-200 transition"
+                            >
+                              🔄 基于此版本恢复
+                            </button>
+                            <p class="text-xs text-slate-400 text-center">点击恢复将载入历史内容到编辑器，需手动保存以生成新版本。</p>
+                          </div>
+                          <div v-else class="flex items-center justify-center h-full text-sm text-slate-400">
+                            请选择一个历史版本查看
+                          </div>
                         </div>
                       </div>
                     </div>
 
-                    <article
-                      v-else
-                      class="space-y-4"
-                    >
-                      <div v-if="detectedVars.length > 0" class="rounded-[1.5rem] border border-violet-200 bg-gradient-to-r from-violet-50 to-purple-50 p-5">
-                        <p class="mb-3 text-xs font-medium uppercase tracking-widest text-violet-400">动态变量填充</p>
-                        <div class="flex flex-wrap gap-3">
-                          <div v-for="v in detectedVars" :key="v" class="flex items-center gap-2">
-                            <label class="rounded-xl bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm">{{ v }}</label>
+                    <!-- Normal Content -->
+                    <div v-else>
+                      <div v-if="state.drawerMode === 'edit'" class="space-y-5">
+                        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+                          <div>
+                            <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">标题</label>
                             <input
-                              v-model="state.previewVars[v]"
+                              v-model="state.editor.title"
                               type="text"
-                              :placeholder="'{{ ' + v + ' }}'"
-                              class="w-40 rounded-xl border border-violet-200 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-violet-500"
+                              class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
+                            />
+                          </div>
+                          <div>
+                            <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">分类</label>
+                            <input
+                              v-model="state.editor.category"
+                              type="text"
+                              class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
                             />
                           </div>
                         </div>
-                      </div>
-                      <div
-                        v-if="state.currentPrompt && state.currentPrompt.variables && state.currentPrompt.variables.length > 0"
-                        class="rounded-[1.5rem] border border-indigo-200 bg-indigo-50/50 p-5"
-                      >
-                        <p class="mb-3 text-xs font-medium uppercase tracking-widest text-indigo-400">💡 动态变量配置</p>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <div v-for="varName in state.currentPrompt.variables" :key="varName">
-                            <label class="mb-1.5 block text-sm font-medium text-slate-600">{{ varName }}</label>
-                            <input
-                              v-model="state.variableValues[varName]"
-                              type="text"
-                              :placeholder="'{{ ' + varName + ' }}'"
-                              class="w-full rounded-xl border border-indigo-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
-                            />
+                        <div>
+                          <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">标签</label>
+                          <input
+                            v-model="state.editor.tagsText"
+                            type="text"
+                            placeholder="#分类/通用, #主题/Agent"
+                            class="w-full rounded-xl sm:rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-900"
+                          />
+                        </div>
+                        <div>
+                          <label class="mb-2 block text-sm sm:text-base font-medium text-slate-600">提示词内容</label>
+                          <div class="relative">
+                            <textarea
+                              v-model="state.editor.content"
+                              class="min-h-[300px] md:min-h-[420px] w-full rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 font-mono text-base leading-6 sm:leading-7 text-slate-800 outline-none transition focus:border-slate-900 focus:ring-0 focus:outline-none appearance-none resize-none"
+                              style="overflow-wrap:normal;white-space:pre-wrap;word-break:break-word;-webkit-appearance:none;appearance:none;"
+                            ></textarea>
+                            <button
+                              class="absolute bottom-3 right-3 sm:bottom-4 sm:right-4 rounded-xl sm:rounded-2xl bg-gradient-to-r from-violet-600 to-purple-600 px-3 py-2 sm:px-4 sm:py-2.5 text-sm font-medium text-white shadow-lg shadow-violet-200 hover:from-violet-700 hover:to-purple-700 disabled:opacity-60"
+                              :disabled="state.optimizing"
+                              @click="optimizePromptContent"
+                            >
+                              {{ state.optimizing ? '优化中...' : '✨ AI 优化' }}
+                            </button>
                           </div>
                         </div>
                       </div>
+
                       <article
-                        class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm break-words [overflow-wrap:anywhere]"
-                        v-html="detectedVars.length > 0 ? renderedWithVars : renderedMarkdown"
-                      ></article>
-                    </article>
+                        v-else
+                        class="space-y-4"
+                      >
+                        <div v-if="detectedVars.length > 0" class="rounded-[1.5rem] border border-violet-200 bg-gradient-to-r from-violet-50 to-purple-50 p-5">
+                          <p class="mb-3 text-xs font-medium uppercase tracking-widest text-violet-400">动态变量填充</p>
+                          <div class="flex flex-wrap gap-3">
+                            <div v-for="v in detectedVars" :key="v" class="flex items-center gap-2">
+                              <label class="rounded-xl bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm">{{ v }}</label>
+                              <input
+                                v-model="state.previewVars[v]"
+                                type="text"
+                                :placeholder="'{{ ' + v + ' }}'"
+                                class="w-40 rounded-xl border border-violet-200 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-violet-500"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                        <div
+                          v-if="state.currentPrompt && state.currentPrompt.variables && state.currentPrompt.variables.length > 0"
+                          class="rounded-[1.5rem] border border-indigo-200 bg-indigo-50/50 p-5"
+                        >
+                          <p class="mb-3 text-xs font-medium uppercase tracking-widest text-indigo-400">💡 动态变量配置</p>
+                          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div v-for="varName in state.currentPrompt.variables" :key="varName">
+                              <label class="mb-1.5 block text-sm font-medium text-slate-600">{{ varName }}</label>
+                              <input
+                                v-model="state.variableValues[varName]"
+                                type="text"
+                                :placeholder="'{{ ' + varName + ' }}'"
+                                class="w-full rounded-xl border border-indigo-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                        <article
+                          class="prose prose-slate max-w-none rounded-[2rem] border border-slate-200 bg-slate-50 p-8 shadow-sm break-words [overflow-wrap:anywhere]"
+                          v-html="detectedVars.length > 0 ? renderedWithVars : renderedMarkdown"
+                        ></article>
+                      </article>
+                    </div>
                   </div>
                 </div>
               </div>

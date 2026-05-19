@@ -44,7 +44,9 @@
           toast: null,
           prompts: [],
           availableTags: [],
+          availableCategories: [],
           selectedTag: "",
+          selectedCategory: "",
           search: "",
           drawerOpen: false,
           drawerMode: "preview",
@@ -66,6 +68,7 @@
           showHistoryPanel: false,
           showTagDropdown: false,
           zenMode: false,
+          categoriesCollapsed: false,
         });
 
         const expandedGroups = reactive({ "分类": true, "模型": true, "主题": true, "其他": true });
@@ -205,6 +208,7 @@
             const params = new URLSearchParams();
             if (state.search.trim()) params.set("q", state.search.trim());
             if (state.selectedTag) params.set("tag", state.selectedTag);
+            if (state.selectedCategory) params.set("category", state.selectedCategory);
             if (state.currentVaultId) params.set("vault_id", String(state.currentVaultId));
             params.set("limit", "60");
             params.set("offset", "0");
@@ -215,6 +219,7 @@
             }
             state.prompts = payload.items || [];
             state.availableTags = payload.available_tags || [];
+            state.availableCategories = payload.available_categories || [];
             if (resetSelection && state.prompts.length > 0) {
               await openPrompt(state.prompts[0].id);
             }
@@ -587,6 +592,11 @@
           loadPrompts();
         }
 
+        function toggleCategory(cat) {
+          state.selectedCategory = state.selectedCategory === cat ? "" : cat;
+          loadPrompts();
+        }
+
         function addTag(tagValue = null) {
           const tag = tagValue !== null ? tagValue : state.tagInput.trim();
           if (tag && !(state.editor.tags || []).map(t => t.toLowerCase()).includes(tag.toLowerCase())) {
@@ -694,6 +704,7 @@
           debouncedSearch,
           onSearchEnter,
           toggleTag,
+          toggleCategory,
           filteredTags,
           groupedTags,
           expandedGroups,
@@ -847,51 +858,98 @@
             </header>
 
             <div class="mx-auto grid max-w-[1600px] grid-cols-1 gap-6 px-4 py-6 md:px-6 xl:grid-cols-[280px_minmax(0,1fr)]">
-              <aside class="space-y-6">
-                <section class="rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm">
-                  <div class="flex items-center justify-between">
+              <aside class="sticky top-[88px] flex h-[calc(100vh-120px)] flex-col gap-4 overflow-hidden xl:w-[280px] flex-shrink-0">
+                <!-- 区块一：目录 / 文件夹 -->
+                <section class="flex flex-col min-h-0 max-h-[45%] rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm transition-all duration-200">
+                  <div class="flex items-center justify-between flex-shrink-0">
                     <div>
-                      <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Filters</p>
-                      <h2 class="mt-2 text-lg font-semibold text-slate-900">标签 / 分类云</h2>
+                      <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Folder</p>
+                      <h2 class="mt-2 text-lg font-semibold text-slate-900">🗂 目录 (Categories)</h2>
                     </div>
-                    <div class="flex items-center gap-2">
+                    <div class="flex items-center gap-1.5">
                       <button
-                        class="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900"
+                        class="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900 transition"
+                        @click="state.categoriesCollapsed = !state.categoriesCollapsed"
+                      >
+                        {{ state.categoriesCollapsed ? '展开' : '收起' }}
+                      </button>
+                      <button
+                        class="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900 transition"
                         @click="newPrompt"
                       >
                         新建
                       </button>
-                      <button
-                        class="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900"
-                        @click="state.tagsCollapsed = !state.tagsCollapsed"
-                      >
-                        {{ state.tagsCollapsed ? '展开' : '收起' }}
-                      </button>
                     </div>
                   </div>
-                  <input v-model="state.tagSearch" type="text" placeholder="过滤标签..." class="w-full mb-4 rounded-xl border border-slate-100 bg-slate-50 px-3 py-1.5 text-xs outline-none focus:border-slate-300" />
-                  <div v-if="!state.tagsCollapsed" class="space-y-3">
-                    <div v-for="(tags, groupName) in groupedTags" :key="groupName">
-                      <button
-                        v-if="tags.length > 0"
-                        @click="expandedGroups[groupName] = !expandedGroups[groupName]"
-                        class="flex items-center gap-1.5 mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition"
-                      >
-                        <svg class="h-2.5 w-2.5 transition-transform" :class="expandedGroups[groupName] ? 'rotate-90' : ''" viewBox="0 0 24 24" fill="currentColor"><path d="M9 18l6-6-6-6"/></svg>
-                        {{ groupName }} <span class="font-normal opacity-60">({{ tags.length }})</span>
-                      </button>
-                      <div v-show="expandedGroups[groupName]" class="flex flex-wrap gap-1.5">
+                  <div v-show="!state.categoriesCollapsed" class="mt-4 flex-1 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
+                    <button
+                      class="group flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm font-medium transition"
+                      :class="state.selectedCategory === ''
+                        ? 'bg-slate-900 text-white shadow-sm'
+                        : 'text-slate-500 hover:bg-slate-50 hover:text-slate-700'"
+                      @click="toggleCategory('')"
+                    >
+                      <span class="flex items-center gap-2">
+                        <svg class="h-3.5 w-3.5 flex-shrink-0 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                        所有提示词
+                      </span>
+                    </button>
+                    <button
+                      v-for="cat in state.availableCategories"
+                      :key="cat"
+                      class="group flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm font-medium transition"
+                      :class="state.selectedCategory === cat
+                        ? 'bg-slate-900 text-white shadow-sm'
+                        : 'text-slate-500 hover:bg-slate-50 hover:text-slate-700'"
+                      @click="toggleCategory(cat)"
+                    >
+                      <span class="flex items-center gap-2">
+                        <svg class="h-3.5 w-3.5 flex-shrink-0 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z"/></svg>
+                        {{ cat }}
+                      </span>
+                    </button>
+                  </div>
+                </section>
+
+                <!-- 区块二：标签云 -->
+                <section class="flex flex-col min-h-0 flex-1 rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm transition-all duration-200">
+                  <div class="flex items-center justify-between flex-shrink-0">
+                    <div>
+                      <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Tags</p>
+                      <h2 class="mt-2 text-lg font-semibold text-slate-900">🏷️ 标签 (Tags)</h2>
+                    </div>
+                    <button
+                      class="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:border-slate-900 hover:text-slate-900 transition"
+                      @click="state.tagsCollapsed = !state.tagsCollapsed"
+                    >
+                      {{ state.tagsCollapsed ? '展开' : '收起' }}
+                    </button>
+                  </div>
+                  <input v-model="state.tagSearch" type="text" placeholder="过滤标签..." class="mt-4 flex-shrink-0 w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-1.5 text-xs outline-none focus:border-slate-300" />
+                  <div v-if="!state.tagsCollapsed" class="mt-3 flex-1 overflow-y-auto pr-1 custom-scrollbar">
+                    <div class="space-y-3">
+                      <div v-for="(tags, groupName) in groupedTags" :key="groupName">
                         <button
-                          v-for="tag in tags"
-                          :key="tag.raw"
-                          class="rounded-full border px-2.5 py-1 text-[11px] font-medium transition"
-                          :class="state.selectedTag === tag.raw
-                            ? 'border-slate-900 bg-slate-900 text-white'
-                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:border-slate-900 hover:text-slate-900'"
-                          @click="toggleTag(tag.raw)"
+                          v-if="tags.length > 0"
+                          @click="expandedGroups[groupName] = !expandedGroups[groupName]"
+                          class="flex items-center gap-1.5 mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition"
                         >
-                          {{ tag.name }}
+                          <svg class="h-2.5 w-2.5 transition-transform" :class="expandedGroups[groupName] ? 'rotate-90' : ''" viewBox="0 0 24 24" fill="currentColor"><path d="M9 18l6-6-6-6"/></svg>
+                          {{ groupName }} <span class="font-normal opacity-60">({{ tags.length }})</span>
                         </button>
+                        <div v-show="expandedGroups[groupName]" class="flex flex-wrap gap-1.5">
+                          <button
+                            v-for="tag in tags"
+                            :key="tag.raw"
+                            class="rounded-full border px-2.5 py-1 text-[11px] font-medium transition"
+                            :class="state.selectedTag === tag.raw
+                              ? 'border-slate-900 bg-slate-900 text-white'
+                              : 'border-slate-200 bg-slate-50 text-slate-500 hover:border-slate-900 hover:text-slate-900'"
+                            @click="toggleTag(tag.raw)"
+                          >
+                            {{ tag.name }}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -929,9 +987,13 @@
                   >
                     <div class="flex items-start justify-between gap-3">
                       <h3 class="line-clamp-2 font-bold text-slate-900 tracking-tight text-lg sm:text-xl" v-html="highlightText(item.title, state.search)"></h3>
-                      <span :class="getCategoryStyle(item.category)" class="border px-2 py-0.5 text-[10px] font-bold flex-shrink-0 uppercase tracking-wider rounded">
+                      <button
+                        @click.stop="toggleCategory(item.category)"
+                        :class="getCategoryStyle(item.category)"
+                        class="border px-2 py-0.5 text-[10px] font-bold flex-shrink-0 uppercase tracking-wider rounded hover:opacity-80 hover:shadow-sm transition cursor-pointer"
+                      >
                         {{ item.category }}
-                      </span>
+                      </button>
                     </div>
                     <div class="mt-2 flex flex-wrap gap-2">
                       <span
@@ -1316,6 +1378,19 @@
     }
     input, textarea, select {
       font-size: 16px !important;
+    }
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 4px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 9999px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
     }
   </style>
 </body>

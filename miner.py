@@ -234,6 +234,7 @@ class PromptListItem(BaseModel):
 class PromptListResponse(BaseModel):
     items: list[PromptListItem]
     available_tags: list[str]
+    available_categories: list[str]
     total: int
 
 
@@ -1068,6 +1069,14 @@ def all_available_tags(conn: sqlite3.Connection, vault_id: int | None = None) ->
     return sorted(tag_set)
 
 
+def all_available_categories(conn: sqlite3.Connection, vault_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT category FROM prompts WHERE vault_id = ? AND category != ''",
+        (vault_id,),
+    ).fetchall()
+    return sorted(row["category"] for row in rows)
+
+
 async def export_prompt_to_markdown(uid: str, title: str, content: str, tags: list[str], category: str, updated_at: str, version: int = 1, variables: list[str] | None = None, vault_slug: str = "default") -> None:
     file_path = ensure_vault_path(markdown_file_path(uid, title, vault_slug))
     raw_markdown = render_markdown_document(title, content, tags, category, updated_at, version, variables)
@@ -1481,6 +1490,7 @@ async def delete_vault(vault_id: int) -> JSONResponse:
 async def list_prompts(
     q: str | None = Query(default=None),
     tag: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     vault_id: int | None = Query(default=None),
     limit: int = Query(default=24, ge=1, le=PROMPT_LIST_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
@@ -1500,6 +1510,9 @@ async def list_prompts(
         if tag:
             conditions.append("EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)")
             values.append(tag)
+        if category:
+            conditions.append("category = ?")
+            values.append(category)
 
         sql = "SELECT id, uid, title, tags, category, updated_at, content FROM prompts"
         count_sql = "SELECT COUNT(*) FROM prompts"
@@ -1512,6 +1525,7 @@ async def list_prompts(
         return PromptListResponse(
             items=[row_to_summary(row) for row in rows],
             available_tags=all_available_tags(conn, resolved_vault_id),
+            available_categories=all_available_categories(conn, resolved_vault_id),
             total=total,
         )
     finally:

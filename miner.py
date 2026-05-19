@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import re
+import shutil
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -168,6 +169,7 @@ class PromptEditorPayload(BaseModel):
     tags: list[str] = Field(default_factory=list)
     category: str | None = None
     raw_markdown: str | None = None
+    vault_id: int | None = None
 
     @field_validator("title", "content")
     @classmethod
@@ -187,6 +189,35 @@ class PromptEditorPayload(BaseModel):
                 continue
             tags.append(tag if tag.startswith("#") else f"#{tag}")
         return sorted(set(tags))
+
+
+class VaultCreatePayload(BaseModel):
+    name: str = Field(..., min_length=1)
+    slug: str = Field(..., min_length=1)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("名称不能为空")
+        return normalized
+
+    @field_validator("slug")
+    @classmethod
+    def validate_slug(cls, value: str) -> str:
+        cleaned = sanitize_slug(value)
+        if not cleaned:
+            raise ValueError("slug 格式不合法")
+        return cleaned
+
+
+class VaultResponse(BaseModel):
+    id: int
+    name: str
+    slug: str
+    created_at: str
+    prompt_count: int
 
 
 class PromptListItem(BaseModel):
@@ -216,6 +247,7 @@ class PromptDetail(BaseModel):
     updated_at: str
     version: int = 1
     variables: list[str] = Field(default_factory=list)
+    vault_id: int
 
 
 class MinePromptResponse(BaseModel):
@@ -961,11 +993,15 @@ def row_to_detail(row: sqlite3.Row) -> PromptDetail:
         updated_at=row["updated_at"],
         version=ver,
         variables=vars_val,
+        vault_id=row["vault_id"],
     )
 
 
-def all_available_tags(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute("SELECT tags FROM prompts").fetchall()
+def all_available_tags(conn: sqlite3.Connection, vault_id: int | None = None) -> list[str]:
+    if vault_id is not None:
+        rows = conn.execute("SELECT tags FROM prompts WHERE vault_id = ?", (vault_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT tags FROM prompts").fetchall()
     tag_set: set[str] = set()
     for row in rows:
         tag_set.update(tags_from_json(row["tags"]))
@@ -1003,7 +1039,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
         existing_version,
         variables if variables else None,
     )
-    vault_id = _get_default_vault_id()
+    vault_id = payload.vault_id if payload.vault_id is not None else _get_default_vault_id()
 
     conn = get_conn()
     try:
@@ -1042,6 +1078,8 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                 existing = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
                 if existing is None:
                     raise HTTPException(status_code=404, detail="提示词不存在")
+                # Preserve existing vault_id if payload doesn't specify one
+                effective_vault_id = vault_id if payload.vault_id is not None else (existing["vault_id"] or _get_default_vault_id())
                 conn.execute(
                     """
                     UPDATE prompts
@@ -1058,7 +1096,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
                         updated_at,
                         existing_version,
                         variables_to_json(variables) if variables else None,
-                        vault_id,
+                        effective_vault_id,
                         prompt_id,
                     ),
                 )
@@ -1078,6 +1116,7 @@ def upsert_prompt_record(payload: PromptEditorPayload, uid: str | None = None, p
 async def sync_record_to_file(detail: PromptDetail, previous_uid: str | None = None) -> None:
     version = getattr(detail, 'version', 1)
     variables = getattr(detail, 'variables', None)
+    vault_slug = get_vault_slug(detail.vault_id)
     await export_prompt_to_markdown(
         uid=detail.uid,
         title=detail.title,
@@ -1087,9 +1126,10 @@ async def sync_record_to_file(detail: PromptDetail, previous_uid: str | None = N
         updated_at=detail.updated_at,
         version=version,
         variables=variables,
+        vault_slug=vault_slug,
     )
     if previous_uid and previous_uid != detail.uid:
-        old_path = ensure_vault_path(markdown_file_path(previous_uid, previous_uid))
+        old_path = ensure_vault_path(markdown_file_path(previous_uid, previous_uid, vault_slug))
         if old_path.exists():
             old_path.unlink()
 
@@ -1101,10 +1141,11 @@ async def delete_prompt_record(prompt_id: int) -> PromptDetail:
         conn.close()
         raise HTTPException(status_code=404, detail="提示词不存在")
     detail = row_to_detail(row)
+    vault_slug = get_vault_slug(detail.vault_id)
     with conn:
         conn.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
     conn.close()
-    file_path = ensure_vault_path(markdown_file_path(detail.uid, detail.title))
+    file_path = ensure_vault_path(markdown_file_path(detail.uid, detail.title, vault_slug))
     if file_path.exists():
         file_path.unlink()
     return detail
@@ -1177,6 +1218,15 @@ def _get_default_vault_id() -> int:
         raise RuntimeError("默认知识库不存在")
     _DEFAULT_VAULT_ID = row["id"]
     return _DEFAULT_VAULT_ID
+
+
+def get_vault_slug(vault_id: int) -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT slug FROM vaults WHERE id = ?", (vault_id,)).fetchone()
+    conn.close()
+    if row is None:
+        raise RuntimeError(f"知识库不存在: {vault_id}")
+    return row["slug"]
 
 
 def migrate_filesystem_to_multi_vault() -> None:
@@ -1265,17 +1315,107 @@ async def session(claims: dict = Depends(verify_token)) -> SessionResponse:
     return SessionResponse(authenticated=True, username=str(claims.get("sub") or ""))
 
 
+@app.get("/api/vaults", dependencies=[Depends(verify_token)])
+async def list_vaults() -> list[VaultResponse]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT v.id, v.name, v.slug, v.created_at,
+                   COUNT(p.id) AS prompt_count
+            FROM vaults v
+            LEFT JOIN prompts p ON v.id = p.vault_id
+            GROUP BY v.id
+            ORDER BY v.id
+            """
+        ).fetchall()
+        return [
+            VaultResponse(
+                id=row["id"],
+                name=row["name"],
+                slug=row["slug"],
+                created_at=row["created_at"],
+                prompt_count=row["prompt_count"],
+            )
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+@app.post("/api/vaults", response_model=VaultResponse, dependencies=[Depends(verify_token)])
+async def create_vault(payload: VaultCreatePayload) -> VaultResponse:
+    conn = get_conn()
+    try:
+        vault_count = conn.execute("SELECT COUNT(*) FROM vaults").fetchone()[0]
+        if vault_count >= CONFIG.storage.max_vaults:
+            raise HTTPException(
+                status_code=400,
+                detail=f"知识库数量已达上限 ({CONFIG.storage.max_vaults})",
+            )
+        now = current_timestamp()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO vaults (name, slug, created_at) VALUES (?, ?, ?)",
+                    (payload.name, payload.slug, now),
+                )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="知识库名称或 slug 已存在")
+        vault_id = conn.execute(
+            "SELECT id FROM vaults WHERE slug = ?", (payload.slug,)
+        ).fetchone()["id"]
+        vault_dir(payload.slug)
+        LOGGER.info("创建知识库: id=%s name=%s slug=%s", vault_id, payload.name, payload.slug)
+        return VaultResponse(
+            id=vault_id,
+            name=payload.name,
+            slug=payload.slug,
+            created_at=now,
+            prompt_count=0,
+        )
+    finally:
+        conn.close()
+
+
+@app.delete("/api/vaults/{vault_id}", dependencies=[Depends(verify_token)])
+async def delete_vault(vault_id: int) -> JSONResponse:
+    if vault_id == 1:
+        raise HTTPException(status_code=400, detail="不允许删除默认知识库")
+    conn = get_conn()
+    try:
+        vault = conn.execute(
+            "SELECT id, slug FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
+        if vault is None:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        vault_slug = vault["slug"]
+        with conn:
+            conn.execute("DELETE FROM prompts WHERE vault_id = ?", (vault_id,))
+            conn.execute("DELETE FROM vaults WHERE id = ?", (vault_id,))
+        vault_path = Path(CONFIG.storage.vault_path) / vault_slug
+        if vault_path.exists():
+            shutil.rmtree(vault_path)
+        conn.execute("INSERT INTO prompts_fts(prompts_fts) VALUES('rebuild')")
+        LOGGER.info("删除知识库: id=%s slug=%s", vault_id, vault_slug)
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()
+
+
 @app.get("/api/prompts", response_model=PromptListResponse, dependencies=[Depends(verify_token)])
 async def list_prompts(
     q: str | None = Query(default=None),
     tag: str | None = Query(default=None),
+    vault_id: int | None = Query(default=None),
     limit: int = Query(default=24, ge=1, le=PROMPT_LIST_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> PromptListResponse:
     conn = get_conn()
     try:
-        conditions: list[str] = []
-        values: list[Any] = []
+        resolved_vault_id = vault_id if vault_id is not None else _get_default_vault_id()
+        conditions: list[str] = ["vault_id = ?"]
+        values: list[Any] = [resolved_vault_id]
         if q:
             query_text = q.strip()
             if len(query_text) > SEARCH_QUERY_MAX_LENGTH:
@@ -1289,16 +1429,15 @@ async def list_prompts(
 
         sql = "SELECT id, uid, title, tags, category, updated_at, content FROM prompts"
         count_sql = "SELECT COUNT(*) FROM prompts"
-        if conditions:
-            where_clause = " WHERE " + " AND ".join(conditions)
-            sql += where_clause
-            count_sql += where_clause
+        where_clause = " WHERE " + " AND ".join(conditions)
+        sql += where_clause
+        count_sql += where_clause
         sql += " ORDER BY datetime(updated_at) DESC, id DESC LIMIT ? OFFSET ?"
         rows = conn.execute(sql, [*values, limit, offset]).fetchall()
         total = int(conn.execute(count_sql, values).fetchone()[0])
         return PromptListResponse(
             items=[row_to_summary(row) for row in rows],
-            available_tags=all_available_tags(conn),
+            available_tags=all_available_tags(conn, resolved_vault_id),
             total=total,
         )
     finally:

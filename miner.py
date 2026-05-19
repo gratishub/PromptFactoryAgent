@@ -447,25 +447,33 @@ def init_db() -> None:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
-                title, content, content='prompts', content_rowid='id'
-            )
-            """
-        )
 
-    try:
-        with conn:
+    existing_cols = set(r[1] for r in conn.execute("PRAGMA table_info(prompts)").fetchall())
+    if "version" not in existing_cols:
+        try:
             conn.execute("ALTER TABLE prompts ADD COLUMN version INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        with conn:
+        except sqlite3.OperationalError:
+            pass
+    if "variables" not in existing_cols:
+        try:
             conn.execute("ALTER TABLE prompts ADD COLUMN variables TEXT")
-    except sqlite3.OperationalError:
-        pass
+        except sqlite3.OperationalError:
+            pass
+
+    fts_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='prompts_fts'"
+    ).fetchone()
+    if not fts_exists:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE prompts_fts USING fts5(
+                    title, content, content='prompts', content_rowid='id'
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
 
     conn.close()
 
@@ -920,6 +928,14 @@ def row_to_summary(row: sqlite3.Row) -> PromptListItem:
 
 
 def row_to_detail(row: sqlite3.Row) -> PromptDetail:
+    try:
+        ver = int(row["version"]) if row["version"] is not None else 1
+    except (KeyError, TypeError, ValueError):
+        ver = 1
+    try:
+        vars_val = variables_from_json(row["variables"]) if row["variables"] is not None else []
+    except (KeyError, TypeError):
+        vars_val = []
     return PromptDetail(
         id=row["id"],
         uid=row["uid"],
@@ -929,8 +945,8 @@ def row_to_detail(row: sqlite3.Row) -> PromptDetail:
         category=row["category"],
         raw_markdown=row["raw_markdown"],
         updated_at=row["updated_at"],
-        version=row["version"] if "version" in row and row["version"] is not None else 1,
-        variables=variables_from_json(row["variables"]) if "variables" in row else [],
+        version=ver,
+        variables=vars_val,
     )
 
 

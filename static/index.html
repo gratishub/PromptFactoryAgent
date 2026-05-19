@@ -742,7 +742,7 @@
                             <input
                               v-model="state.previewVars[v]"
                               type="text"
-                              :placeholder="`{{ ${v} }}`"
+                              :placeholder="'{{ ' + v + ' }}'"
                               class="w-40 rounded-xl border border-violet-200 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-violet-500"
                             />
                           </div>
